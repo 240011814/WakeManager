@@ -41,6 +41,11 @@ esp_err_t wol_send(const uint8_t mac[6]);
  */
 esp_err_t wol_send_str(const char *mac_str);
 
+/**
+ * @brief Send a magic packet to the configured default target.
+ */
+esp_err_t wol_send_default(void);
+
 #ifdef __cplusplus
 }
 #endif

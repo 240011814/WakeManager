@@ -14,11 +14,13 @@
 #include <esp_chip_info.h>
 #include <esp_flash.h>
 #include <esp_system.h>
+#include <nvs_flash.h>
 #include "sdkconfig.h"
 
 #include "wifi_prov.h"
 #include "led_status.h"
 #include "app_config.h"
+#include "config_store.h"
 #include "control_http.h"
 #include "control_mqtt.h"
 
@@ -62,6 +64,16 @@ void app_main(void)
     /* Status indicator: starts blinking until Wi-Fi is connected */
     led_status_init();
     led_status_set(LED_STATUS_CONNECTING);
+
+    /* NVS is needed by Wi-Fi, provisioning and the config store */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
+
+    /* Load runtime configuration (NVS, falling back to app_config.h defaults) */
+    ESP_ERROR_CHECK(config_store_init());
 
     /* Initialize Wi-Fi and provisioning (or connect if already provisioned) */
     ESP_ERROR_CHECK(wifi_prov_start());

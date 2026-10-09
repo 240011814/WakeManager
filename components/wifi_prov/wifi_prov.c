@@ -15,7 +15,6 @@
 #include <esp_wifi.h>
 #include <esp_event.h>
 #include <esp_netif.h>
-#include <nvs_flash.h>
 
 #include <network_provisioning/manager.h>
 #include <network_provisioning/scheme_ble.h>
@@ -170,12 +169,8 @@ static void prov_print_qr(const char *name, const char *pop, const char *transpo
 
 esp_err_t wifi_prov_start(void)
 {
-    /* NVS is required by both the Wi-Fi driver and the provisioning manager */
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ESP_ERROR_CHECK(nvs_flash_init());
-    }
+    /* Note: NVS (and esp_netif/event loop) must be initialized by the caller.
+     * app_main() calls nvs_flash_init() and config_store_init() first. */
 
     /* Initialize TCP/IP stack and the default event loop */
     ESP_ERROR_CHECK(esp_netif_init());

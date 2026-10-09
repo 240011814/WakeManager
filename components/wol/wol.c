@@ -19,6 +19,7 @@
 #include <esp_log.h>
 
 #include "app_config.h"
+#include "config_store.h"
 
 static const char *TAG = "wol";
 
@@ -69,6 +70,11 @@ esp_err_t wol_send(const uint8_t mac[6])
         memcpy(&packet[6 + i * 6], mac, 6);
     }
 
+    wm_config_t cfg;
+    config_store_get(&cfg);
+    uint16_t port = (cfg.wol_udp_port != 0) ? cfg.wol_udp_port : WOL_UDP_PORT;
+    const char *bcast = (cfg.wol_broadcast[0] != '\0') ? cfg.wol_broadcast : WOL_BROADCAST_ADDR;
+
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
         ESP_LOGE(TAG, "socket() failed: errno %d", errno);
@@ -80,8 +86,8 @@ esp_err_t wol_send(const uint8_t mac[6])
 
     struct sockaddr_in dest = {
         .sin_family = AF_INET,
-        .sin_port = htons(WOL_UDP_PORT),
-        .sin_addr.s_addr = inet_addr(WOL_BROADCAST_ADDR),
+        .sin_port = htons(port),
+        .sin_addr.s_addr = inet_addr(bcast),
     };
 
     ssize_t sent = sendto(sock, packet, sizeof(packet), 0,
@@ -96,8 +102,7 @@ esp_err_t wol_send(const uint8_t mac[6])
 
     char mac_str[18];
     wol_mac_to_str(mac, mac_str, sizeof(mac_str));
-    ESP_LOGI(TAG, "Magic packet sent to %s (%s:%d)",
-             mac_str, WOL_BROADCAST_ADDR, WOL_UDP_PORT);
+    ESP_LOGI(TAG, "Magic packet sent to %s (%s:%d)", mac_str, bcast, port);
     return ESP_OK;
 }
 
@@ -109,4 +114,14 @@ esp_err_t wol_send_str(const char *mac_str)
         return ESP_ERR_INVALID_ARG;
     }
     return wol_send(mac);
+}
+
+esp_err_t wol_send_default(void)
+{
+    wm_config_t cfg;
+    config_store_get(&cfg);
+    if (cfg.default_mac[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return wol_send_str(cfg.default_mac);
 }

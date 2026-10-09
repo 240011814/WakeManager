@@ -1,11 +1,14 @@
 /*
  * WakeManager - MQTT control client
  *
- * Subscribes to WOL_MQTT_CMD_TOPIC and wakes a target on command:
- *   "wake"                     -> wake the default target
- *   "wake AA:BB:CC:DD:EE:FF"   -> wake the given target
- *   "AA:BB:CC:DD:EE:FF"        -> wake the given target
- * Results are published to WOL_MQTT_STATUS_TOPIC.
+ * Subscribes to the configured command topic and wakes a target on command:
+ *   "wake"        -> wake the configured default target
+ *   "wake <MAC>"  -> wake the given target
+ *   "<MAC>"       -> wake the given target
+ * Results are published to the configured status topic.
+ *
+ * All connection parameters (broker, username, password, topics, enabled)
+ * come from config_store and can be changed from the web UI at runtime.
  */
 
 #include "control_mqtt.h"
@@ -15,28 +18,93 @@
 #include <stdio.h>
 #include <ctype.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "mqtt_client.h"
 #include "esp_log.h"
 
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
+#include "arpa/inet.h"
+
 #include "app_config.h"
+#include "config_store.h"
 #include "wol.h"
 
 static const char *TAG = "mqtt";
 
 static esp_mqtt_client_handle_t s_client = NULL;
+static volatile bool s_connected = false;
+
+/* Persistent copy of the config: the MQTT client keeps pointers into these
+ * strings for its whole lifetime, so they must outlive the client. */
+static wm_config_t s_cfg;
 
 /* Accumulator for a command split across MQTT_EVENT_DATA chunks */
 static char s_cmd[64];
 static int s_cmd_len = 0;
 
+/* One-shot DNS diagnostic: log the broker host and the IP(s) the device
+ * resolves it to. Distinguishes DNS problems (e.g. a hijacked/fake DNS
+ * returning an unroutable address) from firewall/routing problems. */
+static void dns_debug_task(void *arg)
+{
+    const char *uri = (const char *)arg;
+
+    const char *p = strstr(uri, "://");
+    p = (p != NULL) ? p + 3 : uri;
+
+    char host[128] = {0};
+    char port[8] = "1883";
+
+    const char *colon = strchr(p, ':');
+    const char *slash = strchr(p, '/');
+    size_t hlen = colon ? (size_t)(colon - p)
+                        : (slash ? (size_t)(slash - p) : strlen(p));
+    if (hlen >= sizeof(host)) {
+        hlen = sizeof(host) - 1;
+    }
+    memcpy(host, p, hlen);
+    host[hlen] = '\0';
+
+    if (colon != NULL) {
+        const char *pe = (slash != NULL && slash > colon) ? slash : p + strlen(p);
+        size_t plen = pe - (colon + 1);
+        if (plen >= sizeof(port)) {
+            plen = sizeof(port) - 1;
+        }
+        memcpy(port, colon + 1, plen);
+        port[plen] = '\0';
+    }
+
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    int rc = getaddrinfo(host, port, &hints, &res);
+    if (rc != 0 || res == NULL) {
+        ESP_LOGE(TAG, "DNS: cannot resolve %s: %d", host, rc);
+    } else {
+        for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+            char ip[16] = "?";
+            struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
+            inet_ntoa_r(sin->sin_addr, ip, sizeof(ip));
+            ESP_LOGI(TAG, "DNS: %s:%s -> %s", host, port, ip);
+        }
+        freeaddrinfo(res);
+    }
+    vTaskDelete(NULL);
+}
+
 static void publish_status(const char *msg)
 {
-    if (s_client != NULL) {
-        esp_mqtt_client_publish(s_client, WOL_MQTT_STATUS_TOPIC, msg, 0, 1, 0);
+    if (s_client != NULL && s_cfg.mqtt_status_topic[0] != '\0') {
+        int msg_id = esp_mqtt_client_publish(s_client, s_cfg.mqtt_status_topic,
+                                             msg, 0, 1, 0);
+        ESP_LOGI(TAG, "Publishing to \"%s\": \"%s\" (msg_id=%d)",
+                 s_cfg.mqtt_status_topic, msg, msg_id);
     }
 }
 
-/* Trim leading/trailing whitespace in place and return the start pointer */
 static char *trim(char *s)
 {
     while (*s != '\0' && isspace((unsigned char)*s)) {
@@ -59,27 +127,19 @@ static void handle_command(const char *cmd)
         return;
     }
 
-    const char *target;
-    if (strncasecmp(text, "wake", 4) == 0 && (text[4] == '\0' || isspace((unsigned char)text[4]))) {
+    esp_err_t err;
+
+    if (strncasecmp(text, "wake", 4) == 0 &&
+        (text[4] == '\0' || isspace((unsigned char)text[4]))) {
         char *arg = trim(text + 4);
-        target = (*arg != '\0') ? arg : WOL_DEFAULT_MAC;
+        err = (*arg != '\0') ? wol_send_str(arg) : wol_send_default();
     } else {
-        target = text; /* assume the payload is a MAC address */
+        /* Assume the payload is a MAC address */
+        err = wol_send_str(text);
     }
 
-    uint8_t mac[6];
-    if (!wol_parse_mac(target, mac)) {
-        ESP_LOGW(TAG, "Ignoring invalid command: %s", text);
-        publish_status("error: invalid MAC address");
-        return;
-    }
-
-    if (wol_send(mac) == ESP_OK) {
-        char mac_str[18];
-        wol_mac_to_str(mac, mac_str, sizeof(mac_str));
-        char status[48];
-        snprintf(status, sizeof(status), "ok: magic packet sent to %s", mac_str);
-        publish_status(status);
+    if (err == ESP_OK) {
+        publish_status("ok: magic packet sent");
     } else {
         publish_status("error: failed to send magic packet");
     }
@@ -93,19 +153,48 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "Connected to broker, subscribing to %s", WOL_MQTT_CMD_TOPIC);
-        esp_mqtt_client_subscribe(client, WOL_MQTT_CMD_TOPIC, 1);
+        s_connected = true;
+        ESP_LOGI(TAG, "Connected to broker, subscribing to %s", s_cfg.mqtt_cmd_topic);
+        if (s_cfg.mqtt_cmd_topic[0] != '\0') {
+            int msg_id = esp_mqtt_client_subscribe(client, s_cfg.mqtt_cmd_topic, 1);
+            ESP_LOGI(TAG, "Subscribe sent, msg_id=%d, topic=%s (qos=1)",
+                     msg_id, s_cfg.mqtt_cmd_topic);
+        }
         publish_status("online");
         break;
 
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "Subscribed, msg_id=%d", event->msg_id);
+        break;
+
+    case MQTT_EVENT_UNSUBSCRIBED:
+        ESP_LOGI(TAG, "Unsubscribed, msg_id=%d", event->msg_id);
+        break;
+
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGD(TAG, "Published, msg_id=%d", event->msg_id);
+        break;
+
     case MQTT_EVENT_DISCONNECTED:
+        s_connected = false;
         ESP_LOGW(TAG, "Disconnected from broker");
         break;
 
     case MQTT_EVENT_DATA: {
-        /* Only act on the command topic; ignore anything else */
-        if (event->topic_len != (int)strlen(WOL_MQTT_CMD_TOPIC) ||
-            strncmp(event->topic, WOL_MQTT_CMD_TOPIC, event->topic_len) != 0) {
+        /* Log every message the broker delivers, whatever the topic. Note the
+         * topic and payload are not NUL-terminated, so use the lengths. */
+        ESP_LOGI(TAG, "Message received: topic=\"%.*s\" payload=\"%.*s\" "
+                      "(%d/%d bytes)%s",
+                 event->topic_len, event->topic,
+                 event->data_len, event->data,
+                 event->current_data_offset + event->data_len,
+                 event->total_data_len,
+                 (event->current_data_offset + event->data_len < event->total_data_len)
+                     ? " [partial]" : "");
+
+        int cmd_len = strlen(s_cfg.mqtt_cmd_topic);
+        if (event->topic_len != cmd_len ||
+            strncmp(event->topic, s_cfg.mqtt_cmd_topic, event->topic_len) != 0) {
             break;
         }
 
@@ -124,9 +213,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         }
         s_cmd[s_cmd_len] = '\0';
 
-        /* Command complete once we have the whole payload */
         if (s_cmd_len >= event->total_data_len) {
-            ESP_LOGI(TAG, "Command received: %s", s_cmd);
+            ESP_LOGI(TAG, "Command received: \"%s\"", s_cmd);
             handle_command(s_cmd);
             s_cmd_len = 0;
         }
@@ -134,7 +222,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     }
 
     case MQTT_EVENT_ERROR:
-        ESP_LOGE(TAG, "MQTT error");
+        s_connected = false;
+        if (event->error_handle != NULL) {
+            ESP_LOGE(TAG, "MQTT error: type=%d, connect_return_code=%d, "
+                          "tls_last_esp_err=0x%x, stack_err=0x%x, sock_errno=%d",
+                     event->error_handle->error_type,
+                     event->error_handle->connect_return_code,
+                     (unsigned)event->error_handle->esp_tls_last_esp_err,
+                     (unsigned)event->error_handle->esp_tls_stack_err,
+                     event->error_handle->esp_transport_sock_errno);
+        } else {
+            ESP_LOGE(TAG, "MQTT error (no error handle)");
+        }
         break;
 
     default:
@@ -144,12 +243,35 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
 esp_err_t control_mqtt_start(void)
 {
+    config_store_get(&s_cfg);
+
+    if (!s_cfg.mqtt_enable) {
+        ESP_LOGI(TAG, "MQTT disabled by configuration");
+        return ESP_OK;
+    }
+    if (s_cfg.mqtt_uri[0] == '\0') {
+        ESP_LOGW(TAG, "MQTT enabled but no broker URI set");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Diagnostic: log the IP the broker hostname resolves to */
+    char *uri_copy = strdup(s_cfg.mqtt_uri);
+    if (uri_copy != NULL) {
+        if (xTaskCreate(dns_debug_task, "mqtt_dns", 3072, uri_copy, 4, NULL) != pdPASS) {
+            free(uri_copy);
+        }
+    }
+
     const esp_mqtt_client_config_t cfg = {
         .broker = {
-            .address.uri = WOL_MQTT_BROKER_URI,
+            .address.uri = s_cfg.mqtt_uri,
         },
         .credentials = {
             .client_id = WOL_MQTT_CLIENT_ID,
+            .username = (s_cfg.mqtt_username[0] != '\0') ? s_cfg.mqtt_username : NULL,
+            .authentication = {
+                .password = (s_cfg.mqtt_password[0] != '\0') ? s_cfg.mqtt_password : NULL,
+            },
         },
     };
 
@@ -160,6 +282,28 @@ esp_err_t control_mqtt_start(void)
     }
 
     esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    ESP_LOGI(TAG, "MQTT client starting, broker: %s", WOL_MQTT_BROKER_URI);
+    ESP_LOGI(TAG, "MQTT client starting, broker: %s", s_cfg.mqtt_uri);
     return esp_mqtt_client_start(s_client);
+}
+
+esp_err_t control_mqtt_stop(void)
+{
+    s_connected = false;
+    if (s_client != NULL) {
+        esp_mqtt_client_stop(s_client);
+        esp_mqtt_client_destroy(s_client);
+        s_client = NULL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t control_mqtt_restart(void)
+{
+    control_mqtt_stop();
+    return control_mqtt_start();
+}
+
+bool control_mqtt_is_connected(void)
+{
+    return s_connected;
 }

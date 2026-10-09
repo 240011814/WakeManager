@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WakeManager</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --fg:#e2e8f0; --muted:#94a3b8;
+          --accent:#38bdf8; --ok:#22c55e; --err:#ef4444; --border:#334155; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:720px; margin:0 auto; padding:16px; }
+  h1 { font-size:1.4rem; margin:8px 0 16px; }
+  h2 { font-size:1rem; margin:0 0 12px; color:var(--accent); }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px;
+          padding:16px; margin-bottom:16px; }
+  .grid { display:grid; grid-template-columns:auto 1fr; gap:6px 12px; }
+  .grid .k { color:var(--muted); }
+  label { display:block; margin:10px 0 4px; color:var(--muted); font-size:.9rem; }
+  input[type=text], input[type=password], input[type=number] {
+    width:100%; padding:9px 11px; border-radius:8px; border:1px solid var(--border);
+    background:#0b1220; color:var(--fg); font-size:.95rem; }
+  input[type=checkbox] { transform:scale(1.15); margin-right:6px; }
+  .row { display:flex; gap:10px; align-items:center; margin-top:12px; }
+  button { background:var(--accent); color:#00121f; border:0; border-radius:8px;
+           padding:10px 16px; font-size:.95rem; font-weight:600; cursor:pointer; }
+  button:active { opacity:.8; }
+  .badge { display:inline-block; padding:2px 9px; border-radius:999px; font-size:.8rem; font-weight:600; }
+  .on  { background:rgba(34,197,94,.15); color:var(--ok); }
+  .off { background:rgba(239,68,68,.15); color:var(--err); }
+  .msg { margin-top:10px; font-size:.9rem; min-height:1.2em; }
+  .msg.ok { color:var(--ok); } .msg.err { color:var(--err); }
+  fieldset { border:1px solid var(--border); border-radius:10px; margin:14px 0 0; padding:12px; }
+  legend { color:var(--muted); font-size:.85rem; padding:0 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>WakeManager</h1>
+
+  <div class="card">
+    <h2>设备状态</h2>
+    <div class="grid">
+      <div class="k">Wi-Fi</div><div id="st_ssid">-</div>
+      <div class="k">IP</div><div id="st_ip">-</div>
+      <div class="k">信号</div><div id="st_rssi">-</div>
+      <div class="k">空闲堆</div><div id="st_heap">-</div>
+      <div class="k">MQTT</div><div id="st_mqtt">-</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>立即唤醒</h2>
+    <label for="wakeMac">目标 MAC（留空使用默认目标）</label>
+    <input type="text" id="wakeMac" placeholder="AA:BB:CC:DD:EE:FF" autocomplete="off">
+    <div class="row"><button onclick="wake()">发送魔术包</button></div>
+    <div class="msg" id="wakeMsg"></div>
+  </div>
+
+  <form class="card" id="cfgForm">
+    <h2>配置</h2>
+
+    <fieldset>
+      <legend>网络唤醒</legend>
+      <label>默认目标 MAC</label>
+      <input type="text" name="default_mac" placeholder="AA:BB:CC:DD:EE:FF" autocomplete="off">
+      <label>UDP 端口</label>
+      <input type="number" name="wol_udp_port" min="1" max="65535" placeholder="9">
+      <label>广播地址</label>
+      <input type="text" name="wol_broadcast" placeholder="255.255.255.255" autocomplete="off">
+    </fieldset>
+
+    <fieldset>
+      <legend>MQTT</legend>
+      <label><input type="checkbox" name="mqtt_enable"> 启用 MQTT</label>
+      <label>Broker 地址</label>
+      <input type="text" name="mqtt_uri" placeholder="mqtt://broker.example.com:1883" autocomplete="off">
+      <label>用户名</label>
+      <input type="text" name="mqtt_username" autocomplete="off">
+      <label>密码</label>
+      <input type="password" name="mqtt_password" autocomplete="new-password">
+      <label>命令主题</label>
+      <input type="text" name="mqtt_cmd_topic" placeholder="wakemanager/cmd" autocomplete="off">
+      <label>状态主题</label>
+      <input type="text" name="mqtt_status_topic" placeholder="wakemanager/status" autocomplete="off">
+    </fieldset>
+
+    <div class="row"><button type="submit">保存配置</button></div>
+    <div class="msg" id="saveMsg"></div>
+  </form>
+</div>
+
+<script>
+const form = document.getElementById('cfgForm');
+const $ = id => document.getElementById(id);
+
+function setMsg(el, text, ok) {
+  el.textContent = text;
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+}
+
+async function refreshStatus() {
+  try {
+    const s = await (await fetch('/api/status')).json();
+    $('st_ssid').textContent = s.ssid || '-';
+    $('st_ip').textContent = s.ip || '-';
+    $('st_rssi').textContent = (s.rssi ? s.rssi + ' dBm' : '-');
+    $('st_heap').textContent = (s.heap || 0) + ' 字节';
+    $('st_mqtt').innerHTML = s.mqtt_connected
+      ? '<span class="badge on">已连接</span>'
+      : '<span class="badge off">未连接</span>';
+  } catch (e) { /* ignore transient errors */ }
+}
+
+async function loadConfig() {
+  try {
+    const c = await (await fetch('/api/config')).json();
+    form.default_mac.value = c.default_mac || '';
+    form.wol_udp_port.value = c.wol_udp_port || 9;
+    form.wol_broadcast.value = c.wol_broadcast || '';
+    form.mqtt_enable.checked = !!c.mqtt_enable;
+    form.mqtt_uri.value = c.mqtt_uri || '';
+    form.mqtt_username.value = c.mqtt_username || '';
+    form.mqtt_password.value = c.mqtt_password || '';
+    form.mqtt_cmd_topic.value = c.mqtt_cmd_topic || '';
+    form.mqtt_status_topic.value = c.mqtt_status_topic || '';
+  } catch (e) { setMsg($('saveMsg'), '读取配置失败', false); }
+}
+
+async function wake() {
+  const mac = $('wakeMac').value.trim();
+  try {
+    const r = await fetch('/api/wake?mac=' + encodeURIComponent(mac));
+    const j = await r.json();
+    if (r.ok) setMsg($('wakeMsg'), '魔术包已发送', true);
+    else setMsg($('wakeMsg'), '发送失败: ' + (j.message || r.status), false);
+  } catch (e) { setMsg($('wakeMsg'), '请求失败', false); }
+}
+
+form.addEventListener('submit', async e => {
+  e.preventDefault();
+  const p = new URLSearchParams();
+  p.set('default_mac', form.default_mac.value.trim());
+  p.set('wol_udp_port', form.wol_udp_port.value.trim());
+  p.set('wol_broadcast', form.wol_broadcast.value.trim());
+  p.set('mqtt_enable', form.mqtt_enable.checked ? '1' : '0');
+  p.set('mqtt_uri', form.mqtt_uri.value.trim());
+  p.set('mqtt_username', form.mqtt_username.value);
+  p.set('mqtt_password', form.mqtt_password.value);
+  p.set('mqtt_cmd_topic', form.mqtt_cmd_topic.value.trim());
+  p.set('mqtt_status_topic', form.mqtt_status_topic.value.trim());
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: p.toString()
+    });
+    if (r.ok) setMsg($('saveMsg'), '已保存，MQTT 已重载', true);
+    else setMsg($('saveMsg'), '保存失败: ' + r.status, false);
+  } catch (e) { setMsg($('saveMsg'), '请求失败', false); }
+});
+
+refreshStatus();
+loadConfig();
+setInterval(refreshStatus, 3000);
+</script>
+</body>
+</html>

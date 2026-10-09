@@ -14,9 +14,11 @@ extern "C" {
  * @brief Start the HTTP control server.
  *
  * Endpoints:
- *   GET /                            - usage / status
- *   GET /wake                        - wake the default target
- *   GET /wake?mac=AA:BB:CC:DD:EE:FF  - wake the given target
+ *   GET  /              - web UI (index.html)
+ *   GET  /api/status    - device/Wi-Fi/MQTT status as JSON
+ *   GET  /api/config    - current configuration as JSON
+ *   POST /api/config    - update configuration (x-www-form-urlencoded)
+ *   GET  /api/wake[?mac=AA:BB:CC:DD:EE:FF] - send a magic packet
  */
 esp_err_t control_http_start(void);
 

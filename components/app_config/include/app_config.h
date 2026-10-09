@@ -30,6 +30,8 @@
 #define WOL_MQTT_ENABLE         1
 #define WOL_MQTT_BROKER_URI     "mqtt://demonkingqianjing.cloud:21883"
 #define WOL_MQTT_CLIENT_ID      "wakemanager"
+#define WOL_MQTT_USERNAME       ""      /* leave empty for anonymous */
+#define WOL_MQTT_PASSWORD       ""      /* leave empty for anonymous */
 /* A message on this topic triggers a wake. Payload can be:
  *   "wake"                     -> wake the default target
  *   "wake AA:BB:CC:DD:EE:FF"   -> wake the given target
