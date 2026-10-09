@@ -25,6 +25,7 @@
 
 #include "app_config.h"
 #include "config_store.h"
+#include "device_info.h"
 #include "wol.h"
 #include "control_mqtt.h"
 
@@ -183,9 +184,14 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     char bcast[16] = "";
     wol_get_default_broadcast(bcast, sizeof(bcast));
 
+    char dev_id[16] = "";
+    device_info_get_id(dev_id, sizeof(dev_id));
+
     int o = 0;
     o = sb_add(s_json, sizeof(s_json), o, "{");
-    o = sb_add(s_json, sizeof(s_json), o, "\"ip\":");
+    o = sb_add(s_json, sizeof(s_json), o, "\"id\":");
+    o = sb_json_str(s_json, sizeof(s_json), o, dev_id);
+    o = sb_add(s_json, sizeof(s_json), o, ",\"ip\":");
     o = sb_json_str(s_json, sizeof(s_json), o, ip);
     o = sb_add(s_json, sizeof(s_json), o, ",\"ssid\":");
     o = sb_json_str(s_json, sizeof(s_json), o, ssid);
@@ -224,6 +230,8 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     o = sb_json_str(s_json, sizeof(s_json), o, cfg.mqtt_password);
     o = sb_add(s_json, sizeof(s_json), o, ",\"mqtt_cmd_topic\":");
     o = sb_json_str(s_json, sizeof(s_json), o, cfg.mqtt_cmd_topic);
+    o = sb_add(s_json, sizeof(s_json), o, ",\"mqtt_broadcast_topic\":");
+    o = sb_json_str(s_json, sizeof(s_json), o, cfg.mqtt_broadcast_topic);
     o = sb_add(s_json, sizeof(s_json), o, ",\"mqtt_status_topic\":");
     o = sb_json_str(s_json, sizeof(s_json), o, cfg.mqtt_status_topic);
     o = sb_add(s_json, sizeof(s_json), o, "}");
@@ -274,6 +282,9 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     }
     if (form_get(body, "mqtt_cmd_topic", tmp, sizeof(tmp))) {
         strlcpy(cfg.mqtt_cmd_topic, tmp, sizeof(cfg.mqtt_cmd_topic));
+    }
+    if (form_get(body, "mqtt_broadcast_topic", tmp, sizeof(tmp))) {
+        strlcpy(cfg.mqtt_broadcast_topic, tmp, sizeof(cfg.mqtt_broadcast_topic));
     }
     if (form_get(body, "mqtt_status_topic", tmp, sizeof(tmp))) {
         strlcpy(cfg.mqtt_status_topic, tmp, sizeof(cfg.mqtt_status_topic));

@@ -33,12 +33,21 @@
 #define WOL_MQTT_CLIENT_ID      "wakemanager"
 #define WOL_MQTT_USERNAME       ""      /* leave empty for anonymous */
 #define WOL_MQTT_PASSWORD       ""      /* leave empty for anonymous */
-/* A message on this topic triggers a wake and must be a JSON object:
- *   {"mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}
- * Both fields are optional: omit "mac" to use the default target, omit "ip"
- * to use the default destination (the configured broadcast, or the subnet
+/* Wake command topic. Each device subscribes to "<topic>/<device_id>", where
+ * <device_id> is the Wi-Fi station MAC as 12 hex chars (e.g. A1B2C3D4E5F6), so
+ * wake commands are addressed to a single device:
+ *   {"cmd":"wake","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}
+ * Both fields are optional: omit "mac" to use the default target, omit "ip" to
+ * use the default destination (the configured broadcast, or the subnet
  * broadcast auto-derived from this device's IP). */
 #define WOL_MQTT_CMD_TOPIC      "wakemanager/cmd"
+/* Shared broadcast topic. Every device subscribes to it, so a remote that does
+ * not yet know any device id can publish a discovery command here and collect
+ * the replies (each reply carries the device id) from the status topic:
+ *   {"cmd":"status"}
+ * A missing "cmd" is also treated as a status request. Wake commands are NOT
+ * accepted here; they must go to "<cmd_topic>/<device_id>". */
+#define WOL_MQTT_BROADCAST_TOPIC "wakemanager/broadcast"
 /* Device publishes its results/status here */
 #define WOL_MQTT_STATUS_TOPIC   "wakemanager/status"
 

@@ -42,6 +42,7 @@
   <div class="card">
     <h2>设备状态</h2>
     <div class="grid">
+      <div class="k">设备 ID</div><div id="st_id">-</div>
       <div class="k">Wi-Fi</div><div id="st_ssid">-</div>
       <div class="k">IP</div><div id="st_ip">-</div>
       <div class="k">信号</div><div id="st_rssi">-</div>
@@ -83,8 +84,10 @@
       <input type="text" name="mqtt_username" autocomplete="off">
       <label>密码</label>
       <input type="password" name="mqtt_password" autocomplete="new-password">
-      <label>命令主题</label>
+      <label>唤醒命令主题（实际订阅为 <code>主题/设备ID</code>）</label>
       <input type="text" name="mqtt_cmd_topic" placeholder="wakemanager/cmd" autocomplete="off">
+      <label>广播主题（所有设备都订阅，用于发现设备ID）</label>
+      <input type="text" name="mqtt_broadcast_topic" placeholder="wakemanager/broadcast" autocomplete="off">
       <label>状态主题</label>
       <input type="text" name="mqtt_status_topic" placeholder="wakemanager/status" autocomplete="off">
     </fieldset>
@@ -107,6 +110,7 @@ async function refreshStatus() {
   try {
     const s = await (await fetch('/api/status')).json();
     $('st_ssid').textContent = s.ssid || '-';
+    $('st_id').textContent = s.id || '-';
     $('st_ip').textContent = s.ip || '-';
     $('st_rssi').textContent = (s.rssi ? s.rssi + ' dBm' : '-');
     $('st_heap').textContent = (s.heap || 0) + ' 字节';
@@ -128,6 +132,7 @@ async function loadConfig() {
     form.mqtt_username.value = c.mqtt_username || '';
     form.mqtt_password.value = c.mqtt_password || '';
     form.mqtt_cmd_topic.value = c.mqtt_cmd_topic || '';
+    form.mqtt_broadcast_topic.value = c.mqtt_broadcast_topic || '';
     form.mqtt_status_topic.value = c.mqtt_status_topic || '';
   } catch (e) { setMsg($('saveMsg'), '读取配置失败', false); }
 }
@@ -155,6 +160,7 @@ form.addEventListener('submit', async e => {
   p.set('mqtt_username', form.mqtt_username.value);
   p.set('mqtt_password', form.mqtt_password.value);
   p.set('mqtt_cmd_topic', form.mqtt_cmd_topic.value.trim());
+  p.set('mqtt_broadcast_topic', form.mqtt_broadcast_topic.value.trim());
   p.set('mqtt_status_topic', form.mqtt_status_topic.value.trim());
   try {
     const r = await fetch('/api/config', {

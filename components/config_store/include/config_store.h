@@ -31,6 +31,7 @@ typedef struct {
     char     mqtt_username[WM_CFG_USER_LEN];
     char     mqtt_password[WM_CFG_PASS_LEN];
     char     mqtt_cmd_topic[WM_CFG_TOPIC_LEN];
+    char     mqtt_broadcast_topic[WM_CFG_TOPIC_LEN];
     char     mqtt_status_topic[WM_CFG_TOPIC_LEN];
 } wm_config_t;
 

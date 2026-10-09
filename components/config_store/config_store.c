@@ -40,6 +40,7 @@ void config_store_defaults(wm_config_t *out)
     strlcpy(out->mqtt_username, WOL_MQTT_USERNAME, sizeof(out->mqtt_username));
     strlcpy(out->mqtt_password, WOL_MQTT_PASSWORD, sizeof(out->mqtt_password));
     strlcpy(out->mqtt_cmd_topic, WOL_MQTT_CMD_TOPIC, sizeof(out->mqtt_cmd_topic));
+    strlcpy(out->mqtt_broadcast_topic, WOL_MQTT_BROADCAST_TOPIC, sizeof(out->mqtt_broadcast_topic));
     strlcpy(out->mqtt_status_topic, WOL_MQTT_STATUS_TOPIC, sizeof(out->mqtt_status_topic));
 }
 
@@ -100,6 +101,7 @@ esp_err_t config_store_save(const wm_config_t *cfg)
     c.mqtt_username[sizeof(c.mqtt_username) - 1] = '\0';
     c.mqtt_password[sizeof(c.mqtt_password) - 1] = '\0';
     c.mqtt_cmd_topic[sizeof(c.mqtt_cmd_topic) - 1] = '\0';
+    c.mqtt_broadcast_topic[sizeof(c.mqtt_broadcast_topic) - 1] = '\0';
     c.mqtt_status_topic[sizeof(c.mqtt_status_topic) - 1] = '\0';
 
     nvs_handle_t handle;

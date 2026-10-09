@@ -1,14 +1,17 @@
 /*
  * WakeManager - MQTT control client
  *
- * Subscribes to the configured command topic and wakes a target on a JSON
- * command:
- *   {"mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}
- * Both fields are optional:
- *   - "mac" omitted -> use the configured default target
- *   - "ip"  omitted -> use the default destination (configured broadcast, or
- *                      the subnet broadcast derived from this device's IP)
- * Results are published to the configured status topic.
+ * Subscribes to two topics:
+ *   - the shared broadcast topic (config: mqtt_broadcast_topic): a remote that
+ *     does not know any device id publishes a discovery command here and every
+ *     device answers with its status (including its unique id):
+ *       {"cmd":"status"}
+ *   - the per-device wake topic "<cmd_topic>/<device_id>": wake a target:
+ *       {"cmd":"wake","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}
+ *     Both fields are optional: omit "mac" to use the default target, omit
+ *     "ip" to use the default destination (configured broadcast, or the subnet
+ *     broadcast derived from this device's IP).
+ * Replies and results are published to the configured status topic.
  *
  * All connection parameters (broker, username, password, topics, enabled)
  * come from config_store and can be changed from the web UI at runtime.
@@ -17,6 +20,7 @@
 #include "control_mqtt.h"
 
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <ctype.h>
 
@@ -25,6 +29,9 @@
 
 #include "mqtt_client.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
 #include "cJSON.h"
 
 #include "lwip/netdb.h"
@@ -33,6 +40,7 @@
 
 #include "app_config.h"
 #include "config_store.h"
+#include "device_info.h"
 #include "wol.h"
 
 static const char *TAG = "mqtt";
@@ -43,6 +51,11 @@ static volatile bool s_connected = false;
 /* Persistent copy of the config: the MQTT client keeps pointers into these
  * strings for its whole lifetime, so they must outlive the client. */
 static wm_config_t s_cfg;
+
+/* Shared broadcast topic (all devices listen) and the per-device wake topic
+ * ("<cmd topic>/<device id>", e.g. "wakemanager/cmd/A1B2C3D4E5F6"). */
+static char s_bcast_topic[WM_CFG_TOPIC_LEN];
+static char s_wake_topic[WM_CFG_TOPIC_LEN + 16];
 
 /* Accumulator for a command split across MQTT_EVENT_DATA chunks */
 static char s_cmd[192];
@@ -108,6 +121,63 @@ static void publish_status(const char *msg)
     }
 }
 
+/* Build and publish a JSON snapshot of this device's status. Includes the
+ * unique device id so a controller can tell devices apart. */
+static void publish_device_status(void)
+{
+    char dev_id[16] = {0};
+    device_info_get_id(dev_id, sizeof(dev_id));
+
+    wm_config_t cfg;
+    config_store_get(&cfg);
+
+    /* Current IPv4 address of the station interface */
+    char ip[16] = "0.0.0.0";
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif != NULL) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+            esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
+        }
+    }
+
+    /* Current Wi-Fi link information */
+    char ssid[33] = "";
+    int rssi = 0;
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        memcpy(ssid, ap.ssid, sizeof(ap.ssid));
+        ssid[32] = '\0';
+        rssi = ap.rssi;
+    }
+
+    char broadcast[16] = "";
+    wol_get_default_broadcast(broadcast, sizeof(broadcast));
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        publish_status("error: out of memory");
+        return;
+    }
+    cJSON_AddStringToObject(root, "id", dev_id);
+    cJSON_AddStringToObject(root, "ip", ip);
+    cJSON_AddStringToObject(root, "ssid", ssid);
+    cJSON_AddNumberToObject(root, "rssi", rssi);
+    cJSON_AddNumberToObject(root, "heap", (double)esp_get_free_heap_size());
+    cJSON_AddStringToObject(root, "default_mac", cfg.default_mac);
+    cJSON_AddStringToObject(root, "broadcast", broadcast);
+    cJSON_AddBoolToObject(root, "mqtt_connected", s_connected);
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (payload == NULL) {
+        publish_status("error: out of memory");
+        return;
+    }
+    publish_status(payload);
+    cJSON_free(payload);
+}
+
 static char *trim(char *s)
 {
     while (*s != '\0' && isspace((unsigned char)*s)) {
@@ -120,7 +190,37 @@ static char *trim(char *s)
     return s;
 }
 
-static void handle_command(const char *cmd)
+/* Parse a JSON command object. Any of the output buffers may be NULL to skip
+ * that field. Returns false on malformed JSON. */
+static bool parse_command(const char *text,
+                          char *cmd_name, size_t cmd_len,
+                          char *mac_str, size_t mac_len,
+                          char *ip_str, size_t ip_len)
+{
+    cJSON *root = cJSON_Parse(text);
+    if (root == NULL) {
+        return false;
+    }
+
+    const cJSON *jcmd = cJSON_GetObjectItemCaseSensitive(root, "cmd");
+    const cJSON *jmac = cJSON_GetObjectItemCaseSensitive(root, "mac");
+    const cJSON *jip = cJSON_GetObjectItemCaseSensitive(root, "ip");
+    if (cmd_name != NULL && cJSON_IsString(jcmd) && jcmd->valuestring != NULL) {
+        strlcpy(cmd_name, jcmd->valuestring, cmd_len);
+    }
+    if (mac_str != NULL && cJSON_IsString(jmac) && jmac->valuestring != NULL) {
+        strlcpy(mac_str, jmac->valuestring, mac_len);
+    }
+    if (ip_str != NULL && cJSON_IsString(jip) && jip->valuestring != NULL) {
+        strlcpy(ip_str, jip->valuestring, ip_len);
+    }
+    cJSON_Delete(root);
+    return true;
+}
+
+/* Wake command, received on the per-device topic "<cmd>/<device_id>":
+ *   {"cmd":"wake","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"} */
+static void handle_wake_command(const char *cmd)
 {
     char buf[256];
     snprintf(buf, sizeof(buf), "%s", cmd);
@@ -130,28 +230,21 @@ static void handle_command(const char *cmd)
         return;
     }
 
-    /* Only JSON is accepted, e.g.
-     *   {"mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}
-     * Both fields are optional (see the file header). */
-    cJSON *root = cJSON_Parse(text);
-    if (root == NULL) {
-        ESP_LOGW(TAG, "Invalid JSON command: \"%s\"", cmd);
+    char cmd_name[16] = {0};
+    char mac_str[WM_CFG_MAC_LEN] = {0};
+    char ip_str[16] = {0};
+    if (!parse_command(text, cmd_name, sizeof(cmd_name),
+                       mac_str, sizeof(mac_str), ip_str, sizeof(ip_str))) {
+        ESP_LOGW(TAG, "Invalid JSON wake command: \"%s\"", cmd);
         publish_status("error: invalid JSON command");
         return;
     }
 
-    char mac_str[WM_CFG_MAC_LEN] = {0};
-    char ip_str[16] = {0};
-
-    const cJSON *jmac = cJSON_GetObjectItemCaseSensitive(root, "mac");
-    const cJSON *jip = cJSON_GetObjectItemCaseSensitive(root, "ip");
-    if (cJSON_IsString(jmac) && jmac->valuestring != NULL) {
-        strlcpy(mac_str, jmac->valuestring, sizeof(mac_str));
+    if (cmd_name[0] != '\0' && strcasecmp(cmd_name, "wake") != 0) {
+        ESP_LOGW(TAG, "Command \"%s\" is not accepted on the wake topic", cmd_name);
+        publish_status("error: unsupported command on wake topic");
+        return;
     }
-    if (cJSON_IsString(jip) && jip->valuestring != NULL) {
-        strlcpy(ip_str, jip->valuestring, sizeof(ip_str));
-    }
-    cJSON_Delete(root);
 
     const char *target_mac = (mac_str[0] != '\0') ? mac_str : NULL;
     const char *target_ip = (ip_str[0] != '\0') ? ip_str : NULL;
@@ -188,6 +281,38 @@ static void handle_command(const char *cmd)
     }
 }
 
+/* Discovery command, received on the shared broadcast topic:
+ *   {"cmd":"status"}   (a missing "cmd" is also treated as a status request)
+ * Responds by publishing this device's status (with its unique id) so a remote
+ * that does not know any device id yet can discover it. Wake is NOT accepted
+ * here. */
+static void handle_broadcast_command(const char *cmd)
+{
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", cmd);
+    char *text = trim(buf);
+
+    /* An empty ping still triggers an announcement. */
+    if (*text == '\0') {
+        publish_device_status();
+        return;
+    }
+
+    char cmd_name[16] = {0};
+    if (!parse_command(text, cmd_name, sizeof(cmd_name), NULL, 0, NULL, 0)) {
+        ESP_LOGW(TAG, "Invalid JSON broadcast command: \"%s\"", cmd);
+        publish_status("error: invalid JSON command");
+        return;
+    }
+
+    if (cmd_name[0] == '\0' || strcasecmp(cmd_name, "status") == 0) {
+        ESP_LOGI(TAG, "Status requested on broadcast topic, announcing device status");
+        publish_device_status();
+    } else {
+        ESP_LOGW(TAG, "Ignoring command \"%s\" on broadcast topic", cmd_name);
+    }
+}
+
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
@@ -197,11 +322,15 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         s_connected = true;
-        ESP_LOGI(TAG, "Connected to broker, subscribing to %s", s_cfg.mqtt_cmd_topic);
-        if (s_cfg.mqtt_cmd_topic[0] != '\0') {
-            int msg_id = esp_mqtt_client_subscribe(client, s_cfg.mqtt_cmd_topic, 1);
-            ESP_LOGI(TAG, "Subscribe sent, msg_id=%d, topic=%s (qos=1)",
-                     msg_id, s_cfg.mqtt_cmd_topic);
+        if (s_bcast_topic[0] != '\0') {
+            int msg_id = esp_mqtt_client_subscribe(client, s_bcast_topic, 1);
+            ESP_LOGI(TAG, "Subscribed to broadcast topic %s (msg_id=%d)",
+                     s_bcast_topic, msg_id);
+        }
+        if (s_wake_topic[0] != '\0') {
+            int msg_id = esp_mqtt_client_subscribe(client, s_wake_topic, 1);
+            ESP_LOGI(TAG, "Subscribed to wake topic %s (msg_id=%d)",
+                     s_wake_topic, msg_id);
         }
         publish_status("online");
         break;
@@ -235,9 +364,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                  (event->current_data_offset + event->data_len < event->total_data_len)
                      ? " [partial]" : "");
 
-        int cmd_len = strlen(s_cfg.mqtt_cmd_topic);
-        if (event->topic_len != cmd_len ||
-            strncmp(event->topic, s_cfg.mqtt_cmd_topic, event->topic_len) != 0) {
+        int topic_len = event->topic_len;
+        bool is_wake = (s_wake_topic[0] != '\0' &&
+                        topic_len == (int)strlen(s_wake_topic) &&
+                        strncmp(event->topic, s_wake_topic, topic_len) == 0);
+        bool is_bcast = (s_bcast_topic[0] != '\0' &&
+                         topic_len == (int)strlen(s_bcast_topic) &&
+                         strncmp(event->topic, s_bcast_topic, topic_len) == 0);
+        if (!is_wake && !is_bcast) {
             break;
         }
 
@@ -257,8 +391,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         s_cmd[s_cmd_len] = '\0';
 
         if (s_cmd_len >= event->total_data_len) {
-            ESP_LOGI(TAG, "Command received: \"%s\"", s_cmd);
-            handle_command(s_cmd);
+            ESP_LOGI(TAG, "Command received on %s: \"%s\"",
+                     is_wake ? "wake topic" : "broadcast topic", s_cmd);
+            if (is_wake) {
+                handle_wake_command(s_cmd);
+            } else {
+                handle_broadcast_command(s_cmd);
+            }
             s_cmd_len = 0;
         }
         break;
@@ -297,6 +436,17 @@ esp_err_t control_mqtt_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Broadcast topic (shared) and the per-device wake topic (cmd + "/" + id). */
+    char dev_id[16] = {0};
+    device_info_get_id(dev_id, sizeof(dev_id));
+    strlcpy(s_bcast_topic, s_cfg.mqtt_broadcast_topic, sizeof(s_bcast_topic));
+    if (s_cfg.mqtt_cmd_topic[0] != '\0') {
+        snprintf(s_wake_topic, sizeof(s_wake_topic), "%s/%s",
+                 s_cfg.mqtt_cmd_topic, dev_id);
+    } else {
+        s_wake_topic[0] = '\0';
+    }
+
     /* Diagnostic: log the IP the broker hostname resolves to */
     char *uri_copy = strdup(s_cfg.mqtt_uri);
     if (uri_copy != NULL) {
@@ -325,7 +475,8 @@ esp_err_t control_mqtt_start(void)
     }
 
     esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    ESP_LOGI(TAG, "MQTT client starting, broker: %s", s_cfg.mqtt_uri);
+    ESP_LOGI(TAG, "MQTT client starting, broker: %s, id: %s, broadcast: %s, wake: %s",
+             s_cfg.mqtt_uri, dev_id, s_bcast_topic, s_wake_topic);
     return esp_mqtt_client_start(s_client);
 }
 
