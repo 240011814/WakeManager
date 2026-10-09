@@ -1,10 +1,13 @@
 /*
  * WakeManager - MQTT control client
  *
- * Subscribes to the configured command topic and wakes a target on command:
- *   "wake"        -> wake the configured default target
- *   "wake <MAC>"  -> wake the given target
- *   "<MAC>"       -> wake the given target
+ * Subscribes to the configured command topic and wakes a target on a JSON
+ * command:
+ *   {"mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}
+ * Both fields are optional:
+ *   - "mac" omitted -> use the configured default target
+ *   - "ip"  omitted -> use the default destination (configured broadcast, or
+ *                      the subnet broadcast derived from this device's IP)
  * Results are published to the configured status topic.
  *
  * All connection parameters (broker, username, password, topics, enabled)
@@ -14,7 +17,6 @@
 #include "control_mqtt.h"
 
 #include <string.h>
-#include <strings.h>
 #include <stdio.h>
 #include <ctype.h>
 
@@ -23,6 +25,7 @@
 
 #include "mqtt_client.h"
 #include "esp_log.h"
+#include "cJSON.h"
 
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
@@ -42,7 +45,7 @@ static volatile bool s_connected = false;
 static wm_config_t s_cfg;
 
 /* Accumulator for a command split across MQTT_EVENT_DATA chunks */
-static char s_cmd[64];
+static char s_cmd[192];
 static int s_cmd_len = 0;
 
 /* One-shot DNS diagnostic: log the broker host and the IP(s) the device
@@ -119,7 +122,7 @@ static char *trim(char *s)
 
 static void handle_command(const char *cmd)
 {
-    char buf[64];
+    char buf[256];
     snprintf(buf, sizeof(buf), "%s", cmd);
     char *text = trim(buf);
 
@@ -127,19 +130,59 @@ static void handle_command(const char *cmd)
         return;
     }
 
-    esp_err_t err;
-
-    if (strncasecmp(text, "wake", 4) == 0 &&
-        (text[4] == '\0' || isspace((unsigned char)text[4]))) {
-        char *arg = trim(text + 4);
-        err = (*arg != '\0') ? wol_send_str(arg) : wol_send_default();
-    } else {
-        /* Assume the payload is a MAC address */
-        err = wol_send_str(text);
+    /* Only JSON is accepted, e.g.
+     *   {"mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}
+     * Both fields are optional (see the file header). */
+    cJSON *root = cJSON_Parse(text);
+    if (root == NULL) {
+        ESP_LOGW(TAG, "Invalid JSON command: \"%s\"", cmd);
+        publish_status("error: invalid JSON command");
+        return;
     }
 
+    char mac_str[WM_CFG_MAC_LEN] = {0};
+    char ip_str[16] = {0};
+
+    const cJSON *jmac = cJSON_GetObjectItemCaseSensitive(root, "mac");
+    const cJSON *jip = cJSON_GetObjectItemCaseSensitive(root, "ip");
+    if (cJSON_IsString(jmac) && jmac->valuestring != NULL) {
+        strlcpy(mac_str, jmac->valuestring, sizeof(mac_str));
+    }
+    if (cJSON_IsString(jip) && jip->valuestring != NULL) {
+        strlcpy(ip_str, jip->valuestring, sizeof(ip_str));
+    }
+    cJSON_Delete(root);
+
+    const char *target_mac = (mac_str[0] != '\0') ? mac_str : NULL;
+    const char *target_ip = (ip_str[0] != '\0') ? ip_str : NULL;
+
+    if (target_mac == NULL) {
+        /* No MAC supplied. With no IP either, wake the configured default
+         * target; with only an IP, wake the default target on that IP. */
+        if (target_ip == NULL) {
+            esp_err_t err = wol_send_default();
+            publish_status(err == ESP_OK ? "ok: magic packet sent"
+                                         : "error: failed to send magic packet");
+            return;
+        }
+        wm_config_t cfg;
+        config_store_get(&cfg);
+        if (cfg.default_mac[0] == '\0') {
+            ESP_LOGW(TAG, "Command has no MAC address: \"%s\"", cmd);
+            publish_status("error: no MAC address in command");
+            return;
+        }
+        target_mac = cfg.default_mac;
+    }
+
+    ESP_LOGI(TAG, "Wake request: mac=%s ip=%s", target_mac,
+             target_ip ? target_ip : "(default)");
+
+    esp_err_t err = wol_send_str_to(target_mac, target_ip);
     if (err == ESP_OK) {
         publish_status("ok: magic packet sent");
+    } else if (err == ESP_ERR_INVALID_ARG) {
+        publish_status("error: invalid MAC or IP in command");
     } else {
         publish_status("error: failed to send magic packet");
     }

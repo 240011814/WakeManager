@@ -180,6 +180,9 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     wm_config_t cfg;
     config_store_get(&cfg);
 
+    char bcast[16] = "";
+    wol_get_default_broadcast(bcast, sizeof(bcast));
+
     int o = 0;
     o = sb_add(s_json, sizeof(s_json), o, "{");
     o = sb_add(s_json, sizeof(s_json), o, "\"ip\":");
@@ -192,6 +195,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
                control_mqtt_is_connected() ? "true" : "false");
     o = sb_add(s_json, sizeof(s_json), o, ",\"default_mac\":");
     o = sb_json_str(s_json, sizeof(s_json), o, cfg.default_mac);
+    o = sb_add(s_json, sizeof(s_json), o, ",\"broadcast\":");
+    o = sb_json_str(s_json, sizeof(s_json), o, bcast);
     o = sb_add(s_json, sizeof(s_json), o, "}");
 
     return send_json(req, s_json);
@@ -298,16 +303,20 @@ static esp_err_t wake_get_handler(httpd_req_t *req)
     char query[128] = {0};
     char raw[64];
     char mac_str[WM_CFG_MAC_LEN] = {0};
+    char ip_str[16] = {0};
 
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         if (httpd_query_key_value(query, "mac", raw, sizeof(raw)) == ESP_OK) {
             url_decode(mac_str, raw, sizeof(mac_str));
         }
+        if (httpd_query_key_value(query, "ip", raw, sizeof(raw)) == ESP_OK) {
+            url_decode(ip_str, raw, sizeof(ip_str));
+        }
     }
 
     esp_err_t err;
     if (mac_str[0] != '\0') {
-        err = wol_send_str(mac_str);
+        err = wol_send_str_to(mac_str, (ip_str[0] != '\0') ? ip_str : NULL);
     } else {
         err = wol_send_default();
     }
@@ -317,8 +326,9 @@ static esp_err_t wake_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    char resp[64];
-    snprintf(resp, sizeof(resp), "{\"ok\":true,\"mac\":\"%s\"}", mac_str);
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"mac\":\"%s\",\"ip\":\"%s\"}",
+             mac_str, ip_str);
     return send_json(req, resp);
 }
 

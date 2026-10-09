@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include <esp_log.h>
+#include <esp_netif.h>
 
 #include "app_config.h"
 #include "config_store.h"
@@ -24,6 +25,71 @@
 static const char *TAG = "wol";
 
 #define MAGIC_PACKET_LEN    (6 + 6 * 16)
+
+/* Value used when the subnet broadcast cannot be derived. */
+#define WOL_LIMITED_BROADCAST   "255.255.255.255"
+
+/*
+ * Derive the subnet-directed broadcast address from this device's own IPv4
+ * configuration, e.g. an interface at 192.168.1.88/24 yields 192.168.1.255.
+ *
+ * This is computed from IP & netmask (so it works for any prefix length, not
+ * only /24). Falls back to the limited broadcast 255.255.255.255 when the
+ * station interface has no usable IPv4 address (e.g. not connected yet).
+ */
+static void wol_auto_broadcast(struct in_addr *out)
+{
+    out->s_addr = htonl(INADDR_BROADCAST); /* 255.255.255.255 */
+
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif == NULL) {
+        return;
+    }
+
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK ||
+        ip_info.ip.addr == 0 || ip_info.netmask.addr == 0) {
+        return;
+    }
+
+    /* directed broadcast = (ip & netmask) | ~netmask (network byte order) */
+    out->s_addr = (ip_info.ip.addr & ip_info.netmask.addr) | ~ip_info.netmask.addr;
+}
+
+/*
+ * Resolve the default destination used when a command supplies no IP: use the
+ * configured broadcast if one is set, otherwise the auto-derived subnet
+ * broadcast.
+ */
+static void wol_resolve_default(struct in_addr *out)
+{
+    wm_config_t cfg;
+    config_store_get(&cfg);
+
+    if (cfg.wol_broadcast[0] != '\0' &&
+        strcmp(cfg.wol_broadcast, WOL_LIMITED_BROADCAST) != 0) {
+        if (inet_pton(AF_INET, cfg.wol_broadcast, out) == 1) {
+            return;
+        }
+        ESP_LOGW(TAG, "Invalid broadcast \"%s\", using auto-derived address",
+                 cfg.wol_broadcast);
+    }
+
+    wol_auto_broadcast(out);
+}
+
+void wol_get_default_broadcast(char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0) {
+        return;
+    }
+
+    struct in_addr addr;
+    wol_resolve_default(&addr);
+    if (inet_ntop(AF_INET, &addr, out, out_len) == NULL) {
+        snprintf(out, out_len, "%s", WOL_LIMITED_BROADCAST);
+    }
+}
 
 bool wol_parse_mac(const char *str, uint8_t mac[6])
 {
@@ -61,7 +127,7 @@ void wol_mac_to_str(const uint8_t mac[6], char *out, size_t out_len)
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-esp_err_t wol_send(const uint8_t mac[6])
+esp_err_t wol_send_to(const uint8_t mac[6], const char *dest_ip)
 {
     uint8_t packet[MAGIC_PACKET_LEN];
 
@@ -73,7 +139,22 @@ esp_err_t wol_send(const uint8_t mac[6])
     wm_config_t cfg;
     config_store_get(&cfg);
     uint16_t port = (cfg.wol_udp_port != 0) ? cfg.wol_udp_port : WOL_UDP_PORT;
-    const char *bcast = (cfg.wol_broadcast[0] != '\0') ? cfg.wol_broadcast : WOL_BROADCAST_ADDR;
+
+    /* Destination address: an explicit IP from the command overrides; when it
+     * is empty, fall back to the default (configured broadcast, or the subnet
+     * broadcast derived from this device's own IP). */
+    struct in_addr dest_addr;
+    if (dest_ip != NULL && dest_ip[0] != '\0') {
+        if (inet_pton(AF_INET, dest_ip, &dest_addr) != 1) {
+            ESP_LOGE(TAG, "Invalid destination IP: %s", dest_ip);
+            return ESP_ERR_INVALID_ARG;
+        }
+    } else {
+        wol_resolve_default(&dest_addr);
+    }
+
+    char bcast[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &dest_addr, bcast, sizeof(bcast));
 
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
@@ -87,7 +168,7 @@ esp_err_t wol_send(const uint8_t mac[6])
     struct sockaddr_in dest = {
         .sin_family = AF_INET,
         .sin_port = htons(port),
-        .sin_addr.s_addr = inet_addr(bcast),
+        .sin_addr = dest_addr,
     };
 
     ssize_t sent = sendto(sock, packet, sizeof(packet), 0,
@@ -106,14 +187,24 @@ esp_err_t wol_send(const uint8_t mac[6])
     return ESP_OK;
 }
 
-esp_err_t wol_send_str(const char *mac_str)
+esp_err_t wol_send(const uint8_t mac[6])
+{
+    return wol_send_to(mac, NULL);
+}
+
+esp_err_t wol_send_str_to(const char *mac_str, const char *dest_ip)
 {
     uint8_t mac[6];
     if (!wol_parse_mac(mac_str, mac)) {
         ESP_LOGE(TAG, "Invalid MAC address: %s", mac_str ? mac_str : "(null)");
         return ESP_ERR_INVALID_ARG;
     }
-    return wol_send(mac);
+    return wol_send_to(mac, dest_ip);
+}
+
+esp_err_t wol_send_str(const char *mac_str)
+{
+    return wol_send_str_to(mac_str, NULL);
 }
 
 esp_err_t wol_send_default(void)

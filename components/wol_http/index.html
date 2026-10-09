@@ -47,6 +47,7 @@
       <div class="k">信号</div><div id="st_rssi">-</div>
       <div class="k">空闲堆</div><div id="st_heap">-</div>
       <div class="k">MQTT</div><div id="st_mqtt">-</div>
+      <div class="k">广播地址</div><div id="st_bcast">-</div>
     </div>
   </div>
 
@@ -54,6 +55,8 @@
     <h2>立即唤醒</h2>
     <label for="wakeMac">目标 MAC（留空使用默认目标）</label>
     <input type="text" id="wakeMac" placeholder="AA:BB:CC:DD:EE:FF" autocomplete="off">
+    <label for="wakeIp">目标 IP（留空使用默认广播）</label>
+    <input type="text" id="wakeIp" placeholder="自动（留空）" autocomplete="off">
     <div class="row"><button onclick="wake()">发送魔术包</button></div>
     <div class="msg" id="wakeMsg"></div>
   </div>
@@ -68,7 +71,7 @@
       <label>UDP 端口</label>
       <input type="number" name="wol_udp_port" min="1" max="65535" placeholder="9">
       <label>广播地址</label>
-      <input type="text" name="wol_broadcast" placeholder="255.255.255.255" autocomplete="off">
+      <input type="text" name="wol_broadcast" placeholder="自动（留空）" autocomplete="off">
     </fieldset>
 
     <fieldset>
@@ -110,6 +113,7 @@ async function refreshStatus() {
     $('st_mqtt').innerHTML = s.mqtt_connected
       ? '<span class="badge on">已连接</span>'
       : '<span class="badge off">未连接</span>';
+    $('st_bcast').textContent = s.broadcast || '-';
   } catch (e) { /* ignore transient errors */ }
 }
 
@@ -130,8 +134,10 @@ async function loadConfig() {
 
 async function wake() {
   const mac = $('wakeMac').value.trim();
+  const ip = $('wakeIp').value.trim();
   try {
-    const r = await fetch('/api/wake?mac=' + encodeURIComponent(mac));
+    const r = await fetch('/api/wake?mac=' + encodeURIComponent(mac) +
+                          '&ip=' + encodeURIComponent(ip));
     const j = await r.json();
     if (r.ok) setMsg($('wakeMsg'), '魔术包已发送', true);
     else setMsg($('wakeMsg'), '发送失败: ' + (j.message || r.status), false);
