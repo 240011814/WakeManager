@@ -23,8 +23,6 @@
  * Published topics:
  *   - status (WOL_MQTT_STATUS_TOPIC): command results, discovery replies and
  *     the address book listing.
- *   - temperature (WOL_MQTT_TEMP_TOPIC + "/" + id): the internal temperature,
- *     published once per minute.
  *
  * Connection parameters (broker, username, password, enabled) come from
  * config_store and can be changed from the web UI at runtime.
@@ -54,6 +52,7 @@
 #include "app_config.h"
 #include "config_store.h"
 #include "device_info.h"
+#include "led_status.h"
 #include "wol.h"
 #include "mac_store.h"
 #include "chip_temp.h"
@@ -76,13 +75,10 @@ static char s_bcast_topic[MQTT_TOPIC_MAX];
 static char s_wake_topic[MQTT_TOPIC_MAX];
 static char s_mac_topic[MQTT_TOPIC_MAX];
 static char s_mac_get_topic[MQTT_TOPIC_MAX];
-static char s_temp_topic[MQTT_TOPIC_MAX];
 
 /* Accumulator for a command split across MQTT_EVENT_DATA chunks */
 static char s_cmd[256];
 static int s_cmd_len = 0;
-
-static bool s_temp_task_started = false;
 
 /* Build "<base>/<device_id>" into dst. @p base may be empty (no topic). */
 static void build_topic(char *dst, size_t dst_len, const char *base, const char *dev_id)
@@ -148,6 +144,8 @@ static void dns_debug_task(void *arg)
 static void publish_status(const char *msg)
 {
     if (s_client != NULL) {
+        /* Signal MQTT transmit activity on the LED. */
+        led_status_activity();
         int msg_id = esp_mqtt_client_publish(s_client, WOL_MQTT_STATUS_TOPIC,
                                              msg, 0, 1, 0);
         ESP_LOGI(TAG, "Publishing to \"%s\": \"%s\" (msg_id=%d)",
@@ -457,35 +455,6 @@ static void handle_broadcast_command(const char *cmd)
     }
 }
 
-/* Publish the chip temperature once per minute to "<temp>/<device_id>". */
-static void temp_report_task(void *arg)
-{
-    (void)arg;
-    char dev_id[16] = {0};
-    device_info_get_id(dev_id, sizeof(dev_id));
-
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(TEMP_REPORT_INTERVAL_MS));
-
-        if (!s_connected || s_client == NULL || s_temp_topic[0] == '\0') {
-            continue;
-        }
-
-        float celsius;
-        if (chip_temp_read(&celsius) != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to read chip temperature");
-            continue;
-        }
-
-        char payload[96];
-        snprintf(payload, sizeof(payload), "{\"id\":\"%s\",\"temp_c\":%.2f}",
-                 dev_id, celsius);
-        int msg_id = esp_mqtt_client_publish(s_client, s_temp_topic, payload, 0, 0, 0);
-        ESP_LOGI(TAG, "Temperature report: %s -> \"%s\" (msg_id=%d)",
-                 s_temp_topic, payload, msg_id);
-    }
-}
-
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
@@ -530,6 +499,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         break;
 
     case MQTT_EVENT_DATA: {
+        /* Signal MQTT receive activity on the LED. */
+        led_status_activity();
+
         /* Log every message the broker delivers, whatever the topic. Note the
          * topic and payload are not NUL-terminated, so use the lengths. */
         ESP_LOGI(TAG, "Message received: topic=\"%.*s\" payload=\"%.*s\" "
@@ -629,7 +601,6 @@ esp_err_t control_mqtt_start(void)
     build_topic(s_wake_topic, sizeof(s_wake_topic), WOL_MQTT_CMD_TOPIC, dev_id);
     build_topic(s_mac_topic, sizeof(s_mac_topic), WOL_MQTT_MAC_TOPIC, dev_id);
     build_topic(s_mac_get_topic, sizeof(s_mac_get_topic), WOL_MQTT_MAC_GET_TOPIC, dev_id);
-    build_topic(s_temp_topic, sizeof(s_temp_topic), WOL_MQTT_TEMP_TOPIC, dev_id);
 
     /* Diagnostic: log the IP the broker hostname resolves to */
     char *uri_copy = strdup(s_cfg.mqtt_uri);
@@ -660,18 +631,9 @@ esp_err_t control_mqtt_start(void)
 
     esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     ESP_LOGI(TAG, "MQTT client starting, broker: %s, id: %s", s_cfg.mqtt_uri, dev_id);
-    ESP_LOGI(TAG, "Topics: broadcast=%s wake=%s mac=%s mac_get=%s temp=%s status=%s",
+    ESP_LOGI(TAG, "Topics: broadcast=%s wake=%s mac=%s mac_get=%s status=%s",
              s_bcast_topic, s_wake_topic, s_mac_topic, s_mac_get_topic,
-             s_temp_topic, WOL_MQTT_STATUS_TOPIC);
-
-    /* The temperature reporter runs for the lifetime of the client. */
-    if (!s_temp_task_started) {
-        if (xTaskCreate(temp_report_task, "mqtt_temp", 3072, NULL, 4, NULL) == pdPASS) {
-            s_temp_task_started = true;
-        } else {
-            ESP_LOGW(TAG, "Failed to start temperature report task");
-        }
-    }
+             WOL_MQTT_STATUS_TOPIC);
 
     return esp_mqtt_client_start(s_client);
 }

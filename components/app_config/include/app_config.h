@@ -66,10 +66,6 @@
  * "<topic>/<device_id>" and replies on the status topic with the full list:
  *   {"cmd":"get"}     (a missing/empty "cmd" also triggers the reply) */
 #define WOL_MQTT_MAC_GET_TOPIC  "wakemanager/mac/get"
-/* Chip temperature report topic. The device publishes
- * "<topic>/<device_id>" once per minute with its internal temperature:
- *   {"id":"A1B2C3D4E5F6","temp_c":41.25} */
-#define WOL_MQTT_TEMP_TOPIC     "wakemanager/temp"
 
 /* ---------- Time sync (SNTP) ---------- */
 
@@ -84,10 +80,6 @@
  * when WATCHDOG_TRIGGER_PANIC is 1, the device panics and reboots. */
 #define WATCHDOG_TIMEOUT_MS     30000
 #define WATCHDOG_TRIGGER_PANIC  1
-
-/* ---------- Internal temperature reporting ---------- */
-
-#define TEMP_REPORT_INTERVAL_MS 60000
 
 /* ---------- Wi-Fi provisioning (BLE transport) ---------- */
 

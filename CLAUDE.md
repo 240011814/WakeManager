@@ -136,7 +136,7 @@ WakeManager/
     ├── chip_temp/              # 芯片内部温度传感器（temperature_sensor 驱动）
     ├── time_sync/              # SNTP 自动校时（Wi-Fi 连接成功后启动）
     ├── watchdog/               # 任务看门狗（esp_task_wdt）
-    ├── led_status/             # LED 状态指示（连接中/已连接等）
+    ├── led_status/             # LED 状态指示（连接中/已连接 + MQTT 收发闪烁）
     ├── wifi_prov/              # Wi-Fi BLE 配网
     ├── wol/                    # 魔术包构造与发送（广播地址自动推导）
     ├── wol_http/               # HTTP 服务器 + 单页 Web UI（index.html 内嵌）
@@ -157,7 +157,7 @@ WakeManager/
 
 > **无默认目标 MAC、无广播地址配置项。** 唤醒时 `mac` 必传；目标地址按 运行时 `ip` → 地址簿中该 MAC 的 IP → 自动推导的子网广播 依次决定。
 
-> **MQTT 主题不再是运行时可配置项**，全部固定为 `app_config.h` 中的宏：`WOL_MQTT_CMD_TOPIC`、`WOL_MQTT_BROADCAST_TOPIC`、`WOL_MQTT_STATUS_TOPIC`、`WOL_MQTT_MAC_TOPIC`、`WOL_MQTT_MAC_GET_TOPIC`、`WOL_MQTT_TEMP_TOPIC`。网页 UI 与 `/api/config` 已移除主题字段（升级后旧配置因 blob 长度变化会回退默认值）。
+> **MQTT 主题不再是运行时可配置项**，全部固定为 `app_config.h` 中的宏：`WOL_MQTT_CMD_TOPIC`、`WOL_MQTT_BROADCAST_TOPIC`、`WOL_MQTT_STATUS_TOPIC`、`WOL_MQTT_MAC_TOPIC`、`WOL_MQTT_MAC_GET_TOPIC`。网页 UI 与 `/api/config` 已移除主题字段（升级后旧配置因 blob 长度变化会回退默认值）。
 
 ## MAC/IP 地址簿（mac_store）
 
@@ -227,7 +227,9 @@ WakeManager/
    - 收到 `{"cmd":"get"}`（或空消息）→ 把完整列表发布到状态主题。
    - 列表 JSON：`{"id":"A1B2C3D4E5F6","cmd":"mac_list","count":2,"macs":[{"mac":"AA:BB:...","ip":"192.168.1.5"},...]}`
 
-**发布：** 命令结果、发现应答、地址簿列表发布到 `WOL_MQTT_STATUS_TOPIC`（`wakemanager/status`）；芯片温度发布到 `WOL_MQTT_TEMP_TOPIC` + `/<id>`（如 `wakemanager/temp/A1B2C3D4E5F6`），**每 60 秒一次**：`{"id":"A1B2C3D4E5F6","temp_c":41.25}`。
+**发布：** 命令结果、发现应答、地址簿列表发布到 `WOL_MQTT_STATUS_TOPIC`（`wakemanager/status`）。芯片温度仅在按需发布的状态快照（`temp_c` 字段）中返回，**不再有每 60 秒的周期性温度上报**。
+
+**指示灯：** `led_status` 在 MQTT **收发数据**时使 LED 快速闪烁约 **2 秒**，随后自动恢复到闪烁前由 `led_status_set()` 设定的状态（连接中慢闪 / 已连接常亮）。2 秒窗口内再次收发会重新计时。
 
 **状态上报 JSON 示例：**
 

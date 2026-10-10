@@ -21,16 +21,37 @@ static const char *TAG = "led_status";
 #define LED_ACTIVE_LEVEL    0     /* 0 = active-low (LED lights when pin is low) */
 #define LED_OFF_LEVEL       (!LED_ACTIVE_LEVEL)
 #define LED_BLINK_MS        500   /* half period of the "connecting" blink   */
+
+/* MQTT activity indication: a short flash that overlays the normal state. */
+#define LED_ACTIVITY_BLINK_MS    100   /* half period of the activity flash  */
+#define LED_ACTIVITY_DURATION_MS 2000  /* total time the LED keeps flashing  */
 /* ----------------------------------------------------------------------- */
 
 static volatile led_status_t s_status = LED_STATUS_CONNECTING;
+
+/* While the current tick count is before this deadline, the LED flashes to
+ * signal MQTT activity; afterwards it falls back to s_status. */
+static volatile TickType_t s_activity_until = 0;
+static volatile bool s_activity = false;
 
 static void led_task(void *arg)
 {
     bool on = false;
 
     while (1) {
-        if (s_status == LED_STATUS_CONNECTED) {
+        TickType_t now = xTaskGetTickCount();
+        bool activity = s_activity && (int32_t)(now - s_activity_until) < 0;
+        if (s_activity && !activity) {
+            s_activity = false;
+        }
+
+        if (activity) {
+            /* Fast blink while MQTT traffic is flowing; the normal state
+             * resumes automatically once the window expires. */
+            on = !on;
+            gpio_set_level(LED_GPIO, on ? LED_ACTIVE_LEVEL : LED_OFF_LEVEL);
+            vTaskDelay(pdMS_TO_TICKS(LED_ACTIVITY_BLINK_MS));
+        } else if (s_status == LED_STATUS_CONNECTED) {
             /* Solid on while connected */
             gpio_set_level(LED_GPIO, LED_ACTIVE_LEVEL);
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -62,4 +83,10 @@ void led_status_init(void)
 void led_status_set(led_status_t status)
 {
     s_status = status;
+}
+
+void led_status_activity(void)
+{
+    s_activity_until = xTaskGetTickCount() + pdMS_TO_TICKS(LED_ACTIVITY_DURATION_MS);
+    s_activity = true;
 }

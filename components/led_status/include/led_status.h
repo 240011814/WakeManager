@@ -27,6 +27,15 @@ void led_status_init(void);
  */
 void led_status_set(led_status_t status);
 
+/**
+ * @brief Flash the indicator to signal MQTT traffic.
+ *
+ * Blinks the LED for ~2 seconds and then returns to whatever state was set
+ * with led_status_set(). Calling it again while the flash is still running
+ * restarts the 2-second window.
+ */
+void led_status_activity(void);
+
 #ifdef __cplusplus
 }
 #endif

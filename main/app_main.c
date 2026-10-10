@@ -87,7 +87,7 @@ void app_main(void)
     /* Load the persisted MAC/IP address book (NVS) */
     ESP_ERROR_CHECK(mac_store_init());
 
-    /* Internal temperature sensor used for the periodic MQTT report */
+    /* Internal temperature sensor (read on demand for the status snapshot) */
     if (chip_temp_init() != ESP_OK) {
         ESP_LOGW(TAG, "Internal temperature sensor unavailable (continuing)");
     }
