@@ -9,17 +9,16 @@
 
 /* ---------- Wake-on-LAN ---------- */
 
-/* Default target woken when no MAC is supplied in a request */
-#define WOL_DEFAULT_MAC         "AA:BB:CC:DD:EE:FF"
-
 /* UDP port for the magic packet (9 = classic wakeonlan, 7 also common) */
 #define WOL_UDP_PORT            9
 
-/* Where the magic packet is sent. When left empty (or "255.255.255.255") the
- * subnet-directed broadcast is derived automatically from this device's own
- * IP and netmask, e.g. device 192.168.1.88/24 -> 192.168.1.255. Set an explicit
- * address here (e.g. "192.168.1.255") only to override the automatic value. */
-#define WOL_BROADCAST_ADDR      "255.255.255.255"
+/* Destination of a magic packet is decided at send time:
+ *   - an explicit IP in the wake command (HTTP ?ip= / MQTT "ip"), else
+ *   - the IP stored in the address book for the target MAC, else
+ *   - the subnet-directed broadcast derived from this device's own IP and
+ *     netmask, e.g. device 192.168.1.88/24 -> 192.168.1.255 (falling back to
+ *     255.255.255.255 when no usable address is available).
+ * There is no static broadcast setting. */
 
 /* ---------- HTTP control server ---------- */
 
@@ -40,9 +39,10 @@
  * <device_id> is the Wi-Fi station MAC as 12 hex chars (e.g. A1B2C3D4E5F6), so
  * wake commands are addressed to a single device:
  *   {"cmd":"wake","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}
- * Both fields are optional: omit "mac" to use the default target, omit "ip" to
- * use the default destination (the configured broadcast, or the subnet
- * broadcast auto-derived from this device's IP). */
+ * "mac" is required; "ip" is optional and, when omitted, falls back to the IP
+ * stored in the address book for that MAC, then to the default destination
+ * (the configured broadcast, or the subnet broadcast derived from this
+ * device's IP). */
 #define WOL_MQTT_CMD_TOPIC      "wakemanager/cmd"
 /* Shared broadcast topic. Every device subscribes to it, so a remote that does
  * not yet know any device id can publish a discovery command here and collect

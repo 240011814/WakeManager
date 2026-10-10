@@ -17,14 +17,11 @@ extern "C" {
 #define WM_CFG_HOST_LEN     128
 #define WM_CFG_USER_LEN     64
 #define WM_CFG_PASS_LEN     64
-#define WM_CFG_BCAST_LEN    16
 
 /* Runtime configuration. Compile-time defaults come from app_config.h and are
  * overridden by whatever is stored in NVS (set through the web UI). */
 typedef struct {
-    char     default_mac[WM_CFG_MAC_LEN];
     uint16_t wol_udp_port;
-    char     wol_broadcast[WM_CFG_BCAST_LEN];
     bool     mqtt_enable;
     char     mqtt_uri[WM_CFG_HOST_LEN];
     char     mqtt_username[WM_CFG_USER_LEN];

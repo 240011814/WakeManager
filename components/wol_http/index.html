@@ -56,9 +56,9 @@
 
   <div class="card">
     <h2>立即唤醒</h2>
-    <label for="wakeMac">目标 MAC（留空使用默认目标）</label>
+    <label for="wakeMac">目标 MAC（必填）</label>
     <input type="text" id="wakeMac" placeholder="AA:BB:CC:DD:EE:FF" autocomplete="off">
-    <label for="wakeIp">目标 IP（留空使用默认广播）</label>
+    <label for="wakeIp">目标 IP（留空自动推导广播）</label>
     <input type="text" id="wakeIp" placeholder="自动（留空）" autocomplete="off">
     <div class="row"><button onclick="wake()">发送魔术包</button></div>
     <div class="msg" id="wakeMsg"></div>
@@ -75,12 +75,9 @@
 
     <fieldset>
       <legend>网络唤醒</legend>
-      <label>默认目标 MAC</label>
-      <input type="text" name="default_mac" placeholder="AA:BB:CC:DD:EE:FF" autocomplete="off">
       <label>UDP 端口</label>
       <input type="number" name="wol_udp_port" min="1" max="65535" placeholder="9">
-      <label>广播地址</label>
-      <input type="text" name="wol_broadcast" placeholder="自动（留空）" autocomplete="off">
+      <p class="msg">目标 MAC 在发送时必填，广播地址按本机 IP/掩码自动推导（发送时可传 ip 覆盖）。</p>
     </fieldset>
 
     <fieldset>
@@ -144,9 +141,7 @@ async function refreshMac() {
 async function loadConfig() {
   try {
     const c = await (await fetch('/api/config')).json();
-    form.default_mac.value = c.default_mac || '';
     form.wol_udp_port.value = c.wol_udp_port || 9;
-    form.wol_broadcast.value = c.wol_broadcast || '';
     form.mqtt_enable.checked = !!c.mqtt_enable;
     form.mqtt_uri.value = c.mqtt_uri || '';
     form.mqtt_username.value = c.mqtt_username || '';
@@ -157,6 +152,7 @@ async function loadConfig() {
 async function wake() {
   const mac = $('wakeMac').value.trim();
   const ip = $('wakeIp').value.trim();
+  if (!mac) { setMsg($('wakeMsg'), '请填写目标 MAC', false); return; }
   try {
     const r = await fetch('/api/wake?mac=' + encodeURIComponent(mac) +
                           '&ip=' + encodeURIComponent(ip));
@@ -169,9 +165,7 @@ async function wake() {
 form.addEventListener('submit', async e => {
   e.preventDefault();
   const p = new URLSearchParams();
-  p.set('default_mac', form.default_mac.value.trim());
   p.set('wol_udp_port', form.wol_udp_port.value.trim());
-  p.set('wol_broadcast', form.wol_broadcast.value.trim());
   p.set('mqtt_enable', form.mqtt_enable.checked ? '1' : '0');
   p.set('mqtt_uri', form.mqtt_uri.value.trim());
   p.set('mqtt_username', form.mqtt_username.value);

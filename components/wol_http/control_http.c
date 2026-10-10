@@ -182,9 +182,6 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         rssi = ap.rssi;
     }
 
-    wm_config_t cfg;
-    config_store_get(&cfg);
-
     char bcast[16] = "";
     wol_get_default_broadcast(bcast, sizeof(bcast));
 
@@ -203,8 +200,6 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     o = sb_add(s_json, sizeof(s_json), o, ",\"heap\":%u", (unsigned)esp_get_free_heap_size());
     o = sb_add(s_json, sizeof(s_json), o, ",\"mqtt_connected\":%s",
                control_mqtt_is_connected() ? "true" : "false");
-    o = sb_add(s_json, sizeof(s_json), o, ",\"default_mac\":");
-    o = sb_json_str(s_json, sizeof(s_json), o, cfg.default_mac);
     o = sb_add(s_json, sizeof(s_json), o, ",\"broadcast\":");
     o = sb_json_str(s_json, sizeof(s_json), o, bcast);
     o = sb_add(s_json, sizeof(s_json), o, ",\"mac_count\":%d", mac_store_count());
@@ -231,11 +226,7 @@ static esp_err_t config_get_handler(httpd_req_t *req)
 
     int o = 0;
     o = sb_add(s_json, sizeof(s_json), o, "{");
-    o = sb_add(s_json, sizeof(s_json), o, "\"default_mac\":");
-    o = sb_json_str(s_json, sizeof(s_json), o, cfg.default_mac);
-    o = sb_add(s_json, sizeof(s_json), o, ",\"wol_udp_port\":%u", cfg.wol_udp_port);
-    o = sb_add(s_json, sizeof(s_json), o, ",\"wol_broadcast\":");
-    o = sb_json_str(s_json, sizeof(s_json), o, cfg.wol_broadcast);
+    o = sb_add(s_json, sizeof(s_json), o, "\"wol_udp_port\":%u", cfg.wol_udp_port);
     o = sb_add(s_json, sizeof(s_json), o, ",\"mqtt_enable\":%s",
                cfg.mqtt_enable ? "true" : "false");
     o = sb_add(s_json, sizeof(s_json), o, ",\"mqtt_uri\":");
@@ -262,9 +253,6 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 
     char tmp[WM_CFG_HOST_LEN];
 
-    if (form_get(body, "default_mac", tmp, sizeof(tmp))) {
-        strlcpy(cfg.default_mac, tmp, sizeof(cfg.default_mac));
-    }
     if (form_get(body, "wol_udp_port", tmp, sizeof(tmp))) {
         long p = atol(tmp);
         if (p <= 0 || p > 65535) {
@@ -273,9 +261,6 @@ static esp_err_t config_post_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
         cfg.wol_udp_port = (uint16_t)p;
-    }
-    if (form_get(body, "wol_broadcast", tmp, sizeof(tmp))) {
-        strlcpy(cfg.wol_broadcast, tmp, sizeof(cfg.wol_broadcast));
     }
     if (form_get(body, "mqtt_enable", tmp, sizeof(tmp))) {
         cfg.mqtt_enable = (tmp[0] == '1' || tmp[0] == 't' || tmp[0] == 'T' ||
@@ -291,13 +276,6 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         strlcpy(cfg.mqtt_password, tmp, sizeof(cfg.mqtt_password));
     }
     free(body);
-
-    /* Validate the default MAC if one is set */
-    uint8_t mac[6];
-    if (cfg.default_mac[0] != '\0' && !wol_parse_mac(cfg.default_mac, mac)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid default MAC");
-        return ESP_FAIL;
-    }
 
     if (config_store_save(&cfg) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save config");
@@ -327,11 +305,11 @@ static esp_err_t wake_get_handler(httpd_req_t *req)
     }
 
     esp_err_t err;
-    if (mac_str[0] != '\0') {
-        err = wol_send_str_to(mac_str, (ip_str[0] != '\0') ? ip_str : NULL);
-    } else {
-        err = wol_send_default();
+    if (mac_str[0] == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing mac parameter");
+        return ESP_FAIL;
     }
+    err = wol_send_str_to(mac_str, (ip_str[0] != '\0') ? ip_str : NULL);
 
     if (err != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to send magic packet");

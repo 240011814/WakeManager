@@ -32,9 +32,7 @@ void config_store_defaults(wm_config_t *out)
         return;
     }
     memset(out, 0, sizeof(*out));
-    strlcpy(out->default_mac, WOL_DEFAULT_MAC, sizeof(out->default_mac));
     out->wol_udp_port = WOL_UDP_PORT;
-    strlcpy(out->wol_broadcast, WOL_BROADCAST_ADDR, sizeof(out->wol_broadcast));
     out->mqtt_enable = (WOL_MQTT_ENABLE != 0);
     strlcpy(out->mqtt_uri, WOL_MQTT_BROKER_URI, sizeof(out->mqtt_uri));
     strlcpy(out->mqtt_username, WOL_MQTT_USERNAME, sizeof(out->mqtt_username));
@@ -92,8 +90,6 @@ esp_err_t config_store_save(const wm_config_t *cfg)
 
     /* Make sure every string is null-terminated */
     wm_config_t c = *cfg;
-    c.default_mac[sizeof(c.default_mac) - 1] = '\0';
-    c.wol_broadcast[sizeof(c.wol_broadcast) - 1] = '\0';
     c.mqtt_uri[sizeof(c.mqtt_uri) - 1] = '\0';
     c.mqtt_username[sizeof(c.mqtt_username) - 1] = '\0';
     c.mqtt_password[sizeof(c.mqtt_password) - 1] = '\0';

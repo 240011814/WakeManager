@@ -11,6 +11,8 @@
  *     message) here and every device replies on the status topic with its id.
  *   - wake (WOL_MQTT_CMD_TOPIC + "/" + id): wake a target:
  *       {"cmd":"wake","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}
+ *     "mac" is required; "ip" is optional (address book IP, else auto-derived
+ *     broadcast).
  *   - mac set (WOL_MQTT_MAC_TOPIC + "/" + id): manage the MAC/IP address book:
  *       {"cmd":"set","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.5"}
  *       {"cmd":"del","mac":"AA:BB:CC:DD:EE:FF"}
@@ -160,9 +162,6 @@ static void publish_device_status(void)
     char dev_id[16] = {0};
     device_info_get_id(dev_id, sizeof(dev_id));
 
-    wm_config_t cfg;
-    config_store_get(&cfg);
-
     /* Current IPv4 address of the station interface */
     char ip[16] = "0.0.0.0";
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -196,7 +195,6 @@ static void publish_device_status(void)
     cJSON_AddStringToObject(root, "ssid", ssid);
     cJSON_AddNumberToObject(root, "rssi", rssi);
     cJSON_AddNumberToObject(root, "heap", (double)esp_get_free_heap_size());
-    cJSON_AddStringToObject(root, "default_mac", cfg.default_mac);
     cJSON_AddStringToObject(root, "broadcast", broadcast);
     cJSON_AddBoolToObject(root, "mqtt_connected", s_connected);
     cJSON_AddNumberToObject(root, "mac_count", mac_store_count());
@@ -331,33 +329,20 @@ static void handle_wake_command(const char *cmd)
     const char *target_mac = (mac_str[0] != '\0') ? mac_str : NULL;
     const char *target_ip = (ip_str[0] != '\0') ? ip_str : NULL;
 
-    /* An explicit IP combined with a MAC from the address book makes it easy
-     * to wake a named host: {"cmd":"wake","mac":"..."} uses the stored IP when
-     * the command itself has none. */
+    if (target_mac == NULL) {
+        ESP_LOGW(TAG, "Wake command has no MAC address: \"%s\"", cmd);
+        publish_status("error: no MAC address in command");
+        return;
+    }
+
+    /* When the command itself has no IP, use the one stored for this MAC in
+     * the address book, if any; otherwise the default (auto-derived) broadcast
+     * is used by wol_send_str_to(). */
     char stored_ip[WM_MAC_IP_LEN] = {0};
-    if (target_mac != NULL && target_ip == NULL &&
+    if (target_ip == NULL &&
         mac_store_get_ip(target_mac, stored_ip, sizeof(stored_ip)) && stored_ip[0] != '\0') {
         target_ip = stored_ip;
         ESP_LOGI(TAG, "Using stored IP %s for %s", stored_ip, target_mac);
-    }
-
-    if (target_mac == NULL) {
-        /* No MAC supplied. With no IP either, wake the configured default
-         * target; with only an IP, wake the default target on that IP. */
-        if (target_ip == NULL) {
-            esp_err_t err = wol_send_default();
-            publish_status(err == ESP_OK ? "ok: magic packet sent"
-                                         : "error: failed to send magic packet");
-            return;
-        }
-        wm_config_t cfg;
-        config_store_get(&cfg);
-        if (cfg.default_mac[0] == '\0') {
-            ESP_LOGW(TAG, "Command has no MAC address: \"%s\"", cmd);
-            publish_status("error: no MAC address in command");
-            return;
-        }
-        target_mac = cfg.default_mac;
     }
 
     ESP_LOGI(TAG, "Wake request: mac=%s ip=%s", target_mac,

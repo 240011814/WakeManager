@@ -88,7 +88,7 @@
 
 核心能力：
 
-- **网络唤醒**：向默认目标或指定 MAC 发送 WOL 魔术包；目标广播地址可自动推导。
+- **网络唤醒**：向指定 MAC（必传）发送 WOL 魔术包；目标广播地址自动推导，也可在发送时指定 IP 覆盖。
 - **运行时配置**：所有参数经 NVS 持久化，可在网页上修改。
 - **设备唯一标识**：由 Wi-Fi STA MAC 生成 12 位十六进制 ID，用于 MQTT 寻址与发现。
 - **设备发现**：所有设备订阅同一个广播主题，远程无需预先知道设备 ID 即可先发现再操作。
@@ -151,11 +151,11 @@ WakeManager/
 
 | 字段 | 说明 |
 | --- | --- |
-| `default_mac` | 默认唤醒目标 MAC |
 | `wol_udp_port` | 魔术包 UDP 端口（默认 9） |
-| `wol_broadcast` | 广播地址；**留空或 `255.255.255.255` 时自动推导** |
 | `mqtt_enable` | 是否启用 MQTT |
 | `mqtt_uri` / `mqtt_username` / `mqtt_password` | Broker 与凭据 |
+
+> **无默认目标 MAC、无广播地址配置项。** 唤醒时 `mac` 必传；目标地址按 运行时 `ip` → 地址簿中该 MAC 的 IP → 自动推导的子网广播 依次决定。
 
 > **MQTT 主题不再是运行时可配置项**，全部固定为 `app_config.h` 中的宏：`WOL_MQTT_CMD_TOPIC`、`WOL_MQTT_BROADCAST_TOPIC`、`WOL_MQTT_STATUS_TOPIC`、`WOL_MQTT_MAC_TOPIC`、`WOL_MQTT_MAC_GET_TOPIC`、`WOL_MQTT_TEMP_TOPIC`。网页 UI 与 `/api/config` 已移除主题字段（升级后旧配置因 blob 长度变化会回退默认值）。
 
@@ -164,7 +164,7 @@ WakeManager/
 `components/mac_store`：
 
 - 最多存 **10 组** MAC + IP，整体以单个 blob 存于 NVS 命名空间 `wm_mac`（key `list`），互斥锁保护。
-- MAC 统一规范化为 `AA:BB:CC:DD:EE:FF`；IP 可为空（唤醒时走默认广播）。
+- MAC 统一规范化为 `AA:BB:CC:DD:EE:FF`；IP 可为空（唤醒时走自动推导的广播）。
 - API：`mac_store_init()`、`mac_store_count()`、`mac_store_get()`、`mac_store_set(mac, ip)`、`mac_store_remove(mac)`、`mac_store_clear()`、`mac_store_get_ip(mac, ...)`。
 - 唤醒命令只给 `mac` 时，会自动用地址簿里该 MAC 存的 IP 作为目标（未命中则用默认广播）。
 
@@ -185,9 +185,8 @@ WakeManager/
 `components/wol`：
 
 - 魔术包 = 6 字节 `0xFF` + 目标 MAC 重复 16 次（共 102 字节），UDP 广播发送。
-- **广播地址自动推导**：`directed broadcast = (ip & netmask) | ~netmask`，用网卡（`WIFI_STA_DEF`）的 IP 与掩码计算，支持任意前缀长度（如 `192.168.1.88/24 → 192.168.1.255`）。
-  - 配置了明确地址（且非 `255.255.255.255`）→ 用配置值；
-  - 否则自动推导；网卡无 IP 时回退 `255.255.255.255`。
+- **目标 MAC 必传**；目标地址解析顺序：运行时的 `ip` → 地址簿中该 MAC 存的 IP → 自动推导的子网广播。
+- **广播地址自动推导**：`directed broadcast = (ip & netmask) | ~netmask`，用网卡（`WIFI_STA_DEF`）的 IP 与掩码计算，支持任意前缀长度（如 `192.168.1.88/24 → 192.168.1.255`）；网卡无 IP 时回退 `255.255.255.255`。
 - API：`wol_send(mac)`、`wol_send_to(mac, dest_ip)`、`wol_send_str*()`、`wol_get_default_broadcast()`。
 
 ## HTTP 接口
@@ -197,10 +196,10 @@ WakeManager/
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | 内嵌单页 UI |
-| GET | `/api/status` | 状态 JSON：`id`、`ip`、`ssid`、`rssi`、`heap`、`mqtt_connected`、`default_mac`、`broadcast`、`mac_count`、`temp_c`、`time` |
+| GET | `/api/status` | 状态 JSON：`id`、`ip`、`ssid`、`rssi`、`heap`、`mqtt_connected`、`broadcast`、`mac_count`、`temp_c`、`time` |
 | GET | `/api/config` | 当前配置 JSON |
 | POST | `/api/config` | 保存配置（`x-www-form-urlencoded`），随后重载 MQTT |
-| GET | `/api/wake` | 发送魔术包，可选 `?mac=<MAC>&ip=<IP>` |
+| GET | `/api/wake` | 发送魔术包，**`?mac=<MAC>` 必传**，可选 `?ip=<IP>` |
 | GET | `/api/mac` | 地址簿 JSON：`{"count":n,"macs":[{"mac":...,"ip":...}]}`（增删改经 MQTT） |
 
 ## MQTT 协议
@@ -216,7 +215,7 @@ WakeManager/
 
 2. **唤醒主题**（每设备，`WOL_MQTT_CMD_TOPIC` + `/<id>`，如 `wakemanager/cmd/A1B2C3D4E5F6`）
    - 唤醒命令：`{"cmd":"wake","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}`
-   - `mac`/`ip` 均可选：省略 `mac` 用默认目标，省略 `ip` 优先用地址簿中该 MAC 存的 IP、否则用默认广播地址。
+   - **`mac` 必传**；`ip` 可选，省略时优先用地址簿中该 MAC 存的 IP、否则用自动推导的广播地址。
 
 3. **地址簿设置主题**（每设备，`WOL_MQTT_MAC_TOPIC` + `/<id>`，如 `wakemanager/mac/A1B2C3D4E5F6`）
    - 新增/更新：`{"cmd":"set","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.5"}`（`add`/`update` 同义）
@@ -234,8 +233,7 @@ WakeManager/
 
 ```json
 {"id":"A1B2C3D4E5F6","ip":"192.168.1.88","ssid":"MyWiFi","rssi":-52,
- "heap":123456,"default_mac":"AA:BB:CC:DD:EE:FF",
- "broadcast":"192.168.1.255","mqtt_connected":true,
+ "heap":123456,"broadcast":"192.168.1.255","mqtt_connected":true,
  "mac_count":2,"temp_c":41.25,"time":"2026-10-10 20:30:00"}
 ```
 
@@ -267,9 +265,9 @@ WakeManager/
 - **MINIMAL_BUILD = ON**：新组件必须被 `main` 依赖链引用才会参与构建。
 - **MQTT 数据不是 NUL 结尾**：`event->topic` / `event->data` 需按长度处理，日志用 `%.*s` 打印，避免越界。
 - **MQTT 主题固定**：主题是 `app_config.h` 的宏，不再进 `config_store`，也不在网页 UI 配置；每设备主题 = 基名 + `/<设备ID>`。
-- **配置结构变更**：`wm_config_t` 是整体 blob，改字段会使旧配置失效并回退默认值，升级时需知悉（本次移除主题字段即属此类）。
+- **配置结构变更**：`wm_config_t` 是整体 blob，改字段会使旧配置失效并回退默认值，升级时需知悉（本次移除主题/默认 MAC/广播地址字段即属此类）。
 - **看门狗**：`watchdog_init()` 会 `reconfigure`（IDF 默认已 `CONFIG_ESP_TASK_WDT_INIT` 自动初始化），监控各核 idle 任务，`WATCHDOG_TRIGGER_PANIC=1` 时超时复位。若任务可能长时间阻塞（如等待配网），**不要**提前把它加入看门狗，应在开始循环喂狗后再 `watchdog_add_current_task()`。
 - **SNTP**：`esp_sntp.h` 由 `lwip` 组件提供，需 `CONFIG_LWIP_SNTP_*`（默认开启）；时区用 `setenv("TZ", ...)` + `tzset()` 设置。
-- **广播地址**：仅在配置为空或 `255.255.255.255` 时自动推导；填具体地址即覆盖。
+- **广播地址 / 目标 MAC**：无静态配置；`mac` 必传，目标地址按 运行时 `ip` → 地址簿 IP → 自动推导广播 解析。
 - **本机构建**：`idf.py` 不在 PATH，需用 `python "$IDF_PATH/tools/idf.py"` 调用。
 ```

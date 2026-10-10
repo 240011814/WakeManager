@@ -56,28 +56,6 @@ static void wol_auto_broadcast(struct in_addr *out)
     out->s_addr = (ip_info.ip.addr & ip_info.netmask.addr) | ~ip_info.netmask.addr;
 }
 
-/*
- * Resolve the default destination used when a command supplies no IP: use the
- * configured broadcast if one is set, otherwise the auto-derived subnet
- * broadcast.
- */
-static void wol_resolve_default(struct in_addr *out)
-{
-    wm_config_t cfg;
-    config_store_get(&cfg);
-
-    if (cfg.wol_broadcast[0] != '\0' &&
-        strcmp(cfg.wol_broadcast, WOL_LIMITED_BROADCAST) != 0) {
-        if (inet_pton(AF_INET, cfg.wol_broadcast, out) == 1) {
-            return;
-        }
-        ESP_LOGW(TAG, "Invalid broadcast \"%s\", using auto-derived address",
-                 cfg.wol_broadcast);
-    }
-
-    wol_auto_broadcast(out);
-}
-
 void wol_get_default_broadcast(char *out, size_t out_len)
 {
     if (out == NULL || out_len == 0) {
@@ -85,7 +63,7 @@ void wol_get_default_broadcast(char *out, size_t out_len)
     }
 
     struct in_addr addr;
-    wol_resolve_default(&addr);
+    wol_auto_broadcast(&addr);
     if (inet_ntop(AF_INET, &addr, out, out_len) == NULL) {
         snprintf(out, out_len, "%s", WOL_LIMITED_BROADCAST);
     }
@@ -141,8 +119,8 @@ esp_err_t wol_send_to(const uint8_t mac[6], const char *dest_ip)
     uint16_t port = (cfg.wol_udp_port != 0) ? cfg.wol_udp_port : WOL_UDP_PORT;
 
     /* Destination address: an explicit IP from the command overrides; when it
-     * is empty, fall back to the default (configured broadcast, or the subnet
-     * broadcast derived from this device's own IP). */
+     * is empty, fall back to the subnet broadcast derived from this device's
+     * own IP and netmask. */
     struct in_addr dest_addr;
     if (dest_ip != NULL && dest_ip[0] != '\0') {
         if (inet_pton(AF_INET, dest_ip, &dest_addr) != 1) {
@@ -150,7 +128,7 @@ esp_err_t wol_send_to(const uint8_t mac[6], const char *dest_ip)
             return ESP_ERR_INVALID_ARG;
         }
     } else {
-        wol_resolve_default(&dest_addr);
+        wol_auto_broadcast(&dest_addr);
     }
 
     char bcast[INET_ADDRSTRLEN];
@@ -205,14 +183,4 @@ esp_err_t wol_send_str_to(const char *mac_str, const char *dest_ip)
 esp_err_t wol_send_str(const char *mac_str)
 {
     return wol_send_str_to(mac_str, NULL);
-}
-
-esp_err_t wol_send_default(void)
-{
-    wm_config_t cfg;
-    config_store_get(&cfg);
-    if (cfg.default_mac[0] == '\0') {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return wol_send_str(cfg.default_mac);
 }
