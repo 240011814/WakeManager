@@ -1,20 +1,31 @@
 /*
  * WakeManager - MQTT control client
  *
- * Subscribes to two topics:
- *   - the shared broadcast topic (config: mqtt_broadcast_topic): a remote that
- *     does not know any device id publishes a discovery command here and every
- *     device answers with its status (including its unique id):
- *       {"cmd":"status"}
- *   - the per-device wake topic "<cmd_topic>/<device_id>": wake a target:
- *       {"cmd":"wake","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}
- *     Both fields are optional: omit "mac" to use the default target, omit
- *     "ip" to use the default destination (configured broadcast, or the subnet
- *     broadcast derived from this device's IP).
- * Replies and results are published to the configured status topic.
+ * All topics are fixed at build time (see app_config.h) and the device id
+ * (12 hex chars, e.g. A1B2C3D4E5F6) is appended where a per-device topic is
+ * needed.
  *
- * All connection parameters (broker, username, password, topics, enabled)
- * come from config_store and can be changed from the web UI at runtime.
+ * Subscribed topics:
+ *   - broadcast (shared, WOL_MQTT_BROADCAST_TOPIC): discovery. A remote that
+ *     does not know any device id publishes {"cmd":"status"} (or an empty
+ *     message) here and every device replies on the status topic with its id.
+ *   - wake (WOL_MQTT_CMD_TOPIC + "/" + id): wake a target:
+ *       {"cmd":"wake","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}
+ *   - mac set (WOL_MQTT_MAC_TOPIC + "/" + id): manage the MAC/IP address book:
+ *       {"cmd":"set","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.5"}
+ *       {"cmd":"del","mac":"AA:BB:CC:DD:EE:FF"}
+ *       {"cmd":"clear"}
+ *   - mac get (WOL_MQTT_MAC_GET_TOPIC + "/" + id): query the address book:
+ *       {"cmd":"get"}   (an empty message also triggers a reply)
+ *
+ * Published topics:
+ *   - status (WOL_MQTT_STATUS_TOPIC): command results, discovery replies and
+ *     the address book listing.
+ *   - temperature (WOL_MQTT_TEMP_TOPIC + "/" + id): the internal temperature,
+ *     published once per minute.
+ *
+ * Connection parameters (broker, username, password, enabled) come from
+ * config_store and can be changed from the web UI at runtime.
  */
 
 #include "control_mqtt.h"
@@ -42,8 +53,14 @@
 #include "config_store.h"
 #include "device_info.h"
 #include "wol.h"
+#include "mac_store.h"
+#include "chip_temp.h"
+#include "time_sync.h"
 
 static const char *TAG = "mqtt";
+
+/* Buffer big enough for any fixed topic plus "/" and the 12-char device id. */
+#define MQTT_TOPIC_MAX      (WM_CFG_HOST_LEN)
 
 static esp_mqtt_client_handle_t s_client = NULL;
 static volatile bool s_connected = false;
@@ -52,14 +69,28 @@ static volatile bool s_connected = false;
  * strings for its whole lifetime, so they must outlive the client. */
 static wm_config_t s_cfg;
 
-/* Shared broadcast topic (all devices listen) and the per-device wake topic
- * ("<cmd topic>/<device id>", e.g. "wakemanager/cmd/A1B2C3D4E5F6"). */
-static char s_bcast_topic[WM_CFG_TOPIC_LEN];
-static char s_wake_topic[WM_CFG_TOPIC_LEN + 16];
+/* Fully resolved topics (fixed base + "/" + device id where applicable). */
+static char s_bcast_topic[MQTT_TOPIC_MAX];
+static char s_wake_topic[MQTT_TOPIC_MAX];
+static char s_mac_topic[MQTT_TOPIC_MAX];
+static char s_mac_get_topic[MQTT_TOPIC_MAX];
+static char s_temp_topic[MQTT_TOPIC_MAX];
 
 /* Accumulator for a command split across MQTT_EVENT_DATA chunks */
-static char s_cmd[192];
+static char s_cmd[256];
 static int s_cmd_len = 0;
+
+static bool s_temp_task_started = false;
+
+/* Build "<base>/<device_id>" into dst. @p base may be empty (no topic). */
+static void build_topic(char *dst, size_t dst_len, const char *base, const char *dev_id)
+{
+    if (base == NULL || base[0] == '\0') {
+        dst[0] = '\0';
+        return;
+    }
+    snprintf(dst, dst_len, "%s/%s", base, dev_id);
+}
 
 /* One-shot DNS diagnostic: log the broker host and the IP(s) the device
  * resolves it to. Distinguishes DNS problems (e.g. a hijacked/fake DNS
@@ -111,13 +142,14 @@ static void dns_debug_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* Publish a raw string to the status topic. */
 static void publish_status(const char *msg)
 {
-    if (s_client != NULL && s_cfg.mqtt_status_topic[0] != '\0') {
-        int msg_id = esp_mqtt_client_publish(s_client, s_cfg.mqtt_status_topic,
+    if (s_client != NULL) {
+        int msg_id = esp_mqtt_client_publish(s_client, WOL_MQTT_STATUS_TOPIC,
                                              msg, 0, 1, 0);
         ESP_LOGI(TAG, "Publishing to \"%s\": \"%s\" (msg_id=%d)",
-                 s_cfg.mqtt_status_topic, msg, msg_id);
+                 WOL_MQTT_STATUS_TOPIC, msg, msg_id);
     }
 }
 
@@ -167,6 +199,56 @@ static void publish_device_status(void)
     cJSON_AddStringToObject(root, "default_mac", cfg.default_mac);
     cJSON_AddStringToObject(root, "broadcast", broadcast);
     cJSON_AddBoolToObject(root, "mqtt_connected", s_connected);
+    cJSON_AddNumberToObject(root, "mac_count", mac_store_count());
+
+    float celsius;
+    if (chip_temp_read(&celsius) == ESP_OK) {
+        cJSON_AddNumberToObject(root, "temp_c", (double)celsius);
+    }
+    if (time_sync_is_synced()) {
+        char timebuf[32];
+        time_sync_format(timebuf, sizeof(timebuf));
+        cJSON_AddStringToObject(root, "time", timebuf);
+    }
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (payload == NULL) {
+        publish_status("error: out of memory");
+        return;
+    }
+    publish_status(payload);
+    cJSON_free(payload);
+}
+
+/* Publish the stored MAC/IP address book as JSON. */
+static void publish_mac_list(void)
+{
+    char dev_id[16] = {0};
+    device_info_get_id(dev_id, sizeof(dev_id));
+
+    wm_mac_table_t table;
+    mac_store_get(&table);
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        publish_status("error: out of memory");
+        return;
+    }
+    cJSON_AddStringToObject(root, "id", dev_id);
+    cJSON_AddStringToObject(root, "cmd", "mac_list");
+    cJSON_AddNumberToObject(root, "count", table.count);
+
+    cJSON *arr = cJSON_AddArrayToObject(root, "macs");
+    for (int i = 0; arr != NULL && i < table.count; i++) {
+        cJSON *item = cJSON_CreateObject();
+        if (item == NULL) {
+            break;
+        }
+        cJSON_AddStringToObject(item, "mac", table.entries[i].mac);
+        cJSON_AddStringToObject(item, "ip", table.entries[i].ip);
+        cJSON_AddItemToArray(arr, item);
+    }
 
     char *payload = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -249,6 +331,16 @@ static void handle_wake_command(const char *cmd)
     const char *target_mac = (mac_str[0] != '\0') ? mac_str : NULL;
     const char *target_ip = (ip_str[0] != '\0') ? ip_str : NULL;
 
+    /* An explicit IP combined with a MAC from the address book makes it easy
+     * to wake a named host: {"cmd":"wake","mac":"..."} uses the stored IP when
+     * the command itself has none. */
+    char stored_ip[WM_MAC_IP_LEN] = {0};
+    if (target_mac != NULL && target_ip == NULL &&
+        mac_store_get_ip(target_mac, stored_ip, sizeof(stored_ip)) && stored_ip[0] != '\0') {
+        target_ip = stored_ip;
+        ESP_LOGI(TAG, "Using stored IP %s for %s", stored_ip, target_mac);
+    }
+
     if (target_mac == NULL) {
         /* No MAC supplied. With no IP either, wake the configured default
          * target; with only an IP, wake the default target on that IP. */
@@ -279,6 +371,73 @@ static void handle_wake_command(const char *cmd)
     } else {
         publish_status("error: failed to send magic packet");
     }
+}
+
+/* Address book update, received on the per-device MAC set topic:
+ *   {"cmd":"set","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.5"}
+ *   {"cmd":"del","mac":"AA:BB:CC:DD:EE:FF"}
+ *   {"cmd":"clear"} */
+static void handle_mac_set_command(const char *cmd)
+{
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", cmd);
+    char *text = trim(buf);
+
+    if (*text == '\0') {
+        publish_status("error: empty command on mac topic");
+        return;
+    }
+
+    char cmd_name[16] = {0};
+    char mac_str[WM_CFG_MAC_LEN] = {0};
+    char ip_str[WM_MAC_IP_LEN] = {0};
+    if (!parse_command(text, cmd_name, sizeof(cmd_name),
+                       mac_str, sizeof(mac_str), ip_str, sizeof(ip_str))) {
+        ESP_LOGW(TAG, "Invalid JSON mac command: \"%s\"", cmd);
+        publish_status("error: invalid JSON command");
+        return;
+    }
+
+    if (strcasecmp(cmd_name, "set") == 0 || strcasecmp(cmd_name, "add") == 0 ||
+        strcasecmp(cmd_name, "update") == 0) {
+        if (mac_str[0] == '\0') {
+            publish_status("error: no MAC address in command");
+            return;
+        }
+        esp_err_t err = mac_store_set(mac_str, ip_str);
+        if (err == ESP_OK) {
+            publish_status("ok: mac stored");
+        } else if (err == ESP_ERR_NO_MEM) {
+            publish_status("error: address book full");
+        } else {
+            publish_status("error: invalid MAC or IP");
+        }
+    } else if (strcasecmp(cmd_name, "del") == 0 ||
+               strcasecmp(cmd_name, "delete") == 0 ||
+               strcasecmp(cmd_name, "remove") == 0) {
+        if (mac_str[0] == '\0') {
+            publish_status("error: no MAC address in command");
+            return;
+        }
+        esp_err_t err = mac_store_remove(mac_str);
+        publish_status(err == ESP_OK ? "ok: mac removed" : "error: mac not found");
+    } else if (strcasecmp(cmd_name, "clear") == 0) {
+        esp_err_t err = mac_store_clear();
+        publish_status(err == ESP_OK ? "ok: address book cleared"
+                                     : "error: failed to clear address book");
+    } else {
+        ESP_LOGW(TAG, "Unsupported command \"%s\" on mac topic", cmd_name);
+        publish_status("error: unsupported command on mac topic");
+    }
+}
+
+/* Address book query, received on the per-device MAC get topic. Any payload
+ * (including an empty one) triggers a listing on the status topic. */
+static void handle_mac_get_command(const char *cmd)
+{
+    (void)cmd;
+    ESP_LOGI(TAG, "Address book requested");
+    publish_mac_list();
 }
 
 /* Discovery command, received on the shared broadcast topic:
@@ -313,6 +472,35 @@ static void handle_broadcast_command(const char *cmd)
     }
 }
 
+/* Publish the chip temperature once per minute to "<temp>/<device_id>". */
+static void temp_report_task(void *arg)
+{
+    (void)arg;
+    char dev_id[16] = {0};
+    device_info_get_id(dev_id, sizeof(dev_id));
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(TEMP_REPORT_INTERVAL_MS));
+
+        if (!s_connected || s_client == NULL || s_temp_topic[0] == '\0') {
+            continue;
+        }
+
+        float celsius;
+        if (chip_temp_read(&celsius) != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to read chip temperature");
+            continue;
+        }
+
+        char payload[96];
+        snprintf(payload, sizeof(payload), "{\"id\":\"%s\",\"temp_c\":%.2f}",
+                 dev_id, celsius);
+        int msg_id = esp_mqtt_client_publish(s_client, s_temp_topic, payload, 0, 0, 0);
+        ESP_LOGI(TAG, "Temperature report: %s -> \"%s\" (msg_id=%d)",
+                 s_temp_topic, payload, msg_id);
+    }
+}
+
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
@@ -320,20 +508,24 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     esp_mqtt_client_handle_t client = event->client;
 
     switch ((esp_mqtt_event_id_t)event_id) {
-    case MQTT_EVENT_CONNECTED:
+    case MQTT_EVENT_CONNECTED: {
         s_connected = true;
-        if (s_bcast_topic[0] != '\0') {
-            int msg_id = esp_mqtt_client_subscribe(client, s_bcast_topic, 1);
-            ESP_LOGI(TAG, "Subscribed to broadcast topic %s (msg_id=%d)",
-                     s_bcast_topic, msg_id);
-        }
-        if (s_wake_topic[0] != '\0') {
-            int msg_id = esp_mqtt_client_subscribe(client, s_wake_topic, 1);
-            ESP_LOGI(TAG, "Subscribed to wake topic %s (msg_id=%d)",
-                     s_wake_topic, msg_id);
+        struct { const char *topic; const char *label; } subs[] = {
+            { s_bcast_topic,    "broadcast"  },
+            { s_wake_topic,     "wake"       },
+            { s_mac_topic,      "mac"        },
+            { s_mac_get_topic,  "mac get"    },
+        };
+        for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
+            if (subs[i].topic[0] != '\0') {
+                int msg_id = esp_mqtt_client_subscribe(client, subs[i].topic, 1);
+                ESP_LOGI(TAG, "Subscribed to %s topic %s (msg_id=%d)",
+                         subs[i].label, subs[i].topic, msg_id);
+            }
         }
         publish_status("online");
         break;
+    }
 
     case MQTT_EVENT_SUBSCRIBED:
         ESP_LOGI(TAG, "Subscribed, msg_id=%d", event->msg_id);
@@ -371,7 +563,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         bool is_bcast = (s_bcast_topic[0] != '\0' &&
                          topic_len == (int)strlen(s_bcast_topic) &&
                          strncmp(event->topic, s_bcast_topic, topic_len) == 0);
-        if (!is_wake && !is_bcast) {
+        bool is_mac = (s_mac_topic[0] != '\0' &&
+                       topic_len == (int)strlen(s_mac_topic) &&
+                       strncmp(event->topic, s_mac_topic, topic_len) == 0);
+        bool is_mac_get = (s_mac_get_topic[0] != '\0' &&
+                           topic_len == (int)strlen(s_mac_get_topic) &&
+                           strncmp(event->topic, s_mac_get_topic, topic_len) == 0);
+        if (!is_wake && !is_bcast && !is_mac && !is_mac_get) {
             break;
         }
 
@@ -391,10 +589,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         s_cmd[s_cmd_len] = '\0';
 
         if (s_cmd_len >= event->total_data_len) {
-            ESP_LOGI(TAG, "Command received on %s: \"%s\"",
-                     is_wake ? "wake topic" : "broadcast topic", s_cmd);
+            ESP_LOGI(TAG, "Command received: \"%s\"", s_cmd);
             if (is_wake) {
                 handle_wake_command(s_cmd);
+            } else if (is_mac) {
+                handle_mac_set_command(s_cmd);
+            } else if (is_mac_get) {
+                handle_mac_get_command(s_cmd);
             } else {
                 handle_broadcast_command(s_cmd);
             }
@@ -436,16 +637,14 @@ esp_err_t control_mqtt_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Broadcast topic (shared) and the per-device wake topic (cmd + "/" + id). */
+    /* Resolve all fixed topics; per-device ones get "/<device id>" appended. */
     char dev_id[16] = {0};
     device_info_get_id(dev_id, sizeof(dev_id));
-    strlcpy(s_bcast_topic, s_cfg.mqtt_broadcast_topic, sizeof(s_bcast_topic));
-    if (s_cfg.mqtt_cmd_topic[0] != '\0') {
-        snprintf(s_wake_topic, sizeof(s_wake_topic), "%s/%s",
-                 s_cfg.mqtt_cmd_topic, dev_id);
-    } else {
-        s_wake_topic[0] = '\0';
-    }
+    strlcpy(s_bcast_topic, WOL_MQTT_BROADCAST_TOPIC, sizeof(s_bcast_topic));
+    build_topic(s_wake_topic, sizeof(s_wake_topic), WOL_MQTT_CMD_TOPIC, dev_id);
+    build_topic(s_mac_topic, sizeof(s_mac_topic), WOL_MQTT_MAC_TOPIC, dev_id);
+    build_topic(s_mac_get_topic, sizeof(s_mac_get_topic), WOL_MQTT_MAC_GET_TOPIC, dev_id);
+    build_topic(s_temp_topic, sizeof(s_temp_topic), WOL_MQTT_TEMP_TOPIC, dev_id);
 
     /* Diagnostic: log the IP the broker hostname resolves to */
     char *uri_copy = strdup(s_cfg.mqtt_uri);
@@ -475,8 +674,20 @@ esp_err_t control_mqtt_start(void)
     }
 
     esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    ESP_LOGI(TAG, "MQTT client starting, broker: %s, id: %s, broadcast: %s, wake: %s",
-             s_cfg.mqtt_uri, dev_id, s_bcast_topic, s_wake_topic);
+    ESP_LOGI(TAG, "MQTT client starting, broker: %s, id: %s", s_cfg.mqtt_uri, dev_id);
+    ESP_LOGI(TAG, "Topics: broadcast=%s wake=%s mac=%s mac_get=%s temp=%s status=%s",
+             s_bcast_topic, s_wake_topic, s_mac_topic, s_mac_get_topic,
+             s_temp_topic, WOL_MQTT_STATUS_TOPIC);
+
+    /* The temperature reporter runs for the lifetime of the client. */
+    if (!s_temp_task_started) {
+        if (xTaskCreate(temp_report_task, "mqtt_temp", 3072, NULL, 4, NULL) == pdPASS) {
+            s_temp_task_started = true;
+        } else {
+            ESP_LOGW(TAG, "Failed to start temperature report task");
+        }
+    }
+
     return esp_mqtt_client_start(s_client);
 }
 

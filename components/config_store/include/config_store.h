@@ -17,7 +17,6 @@ extern "C" {
 #define WM_CFG_HOST_LEN     128
 #define WM_CFG_USER_LEN     64
 #define WM_CFG_PASS_LEN     64
-#define WM_CFG_TOPIC_LEN    64
 #define WM_CFG_BCAST_LEN    16
 
 /* Runtime configuration. Compile-time defaults come from app_config.h and are
@@ -30,9 +29,6 @@ typedef struct {
     char     mqtt_uri[WM_CFG_HOST_LEN];
     char     mqtt_username[WM_CFG_USER_LEN];
     char     mqtt_password[WM_CFG_PASS_LEN];
-    char     mqtt_cmd_topic[WM_CFG_TOPIC_LEN];
-    char     mqtt_broadcast_topic[WM_CFG_TOPIC_LEN];
-    char     mqtt_status_topic[WM_CFG_TOPIC_LEN];
 } wm_config_t;
 
 /**

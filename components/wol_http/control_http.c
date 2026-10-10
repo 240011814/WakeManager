@@ -7,6 +7,7 @@
  *   GET  /api/config    -> JSON config
  *   POST /api/config    -> save config (x-www-form-urlencoded) + reload MQTT
  *   GET  /api/wake      -> send a magic packet (optional ?mac=)
+ *   GET  /api/mac       -> MAC/IP address book (managed over MQTT)
  */
 
 #include "control_http.h"
@@ -28,6 +29,9 @@
 #include "device_info.h"
 #include "wol.h"
 #include "control_mqtt.h"
+#include "mac_store.h"
+#include "chip_temp.h"
+#include "time_sync.h"
 
 static const char *TAG = "http";
 
@@ -203,6 +207,18 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     o = sb_json_str(s_json, sizeof(s_json), o, cfg.default_mac);
     o = sb_add(s_json, sizeof(s_json), o, ",\"broadcast\":");
     o = sb_json_str(s_json, sizeof(s_json), o, bcast);
+    o = sb_add(s_json, sizeof(s_json), o, ",\"mac_count\":%d", mac_store_count());
+
+    float celsius;
+    if (chip_temp_read(&celsius) == ESP_OK) {
+        o = sb_add(s_json, sizeof(s_json), o, ",\"temp_c\":%.2f", (double)celsius);
+    }
+    if (time_sync_is_synced()) {
+        char timebuf[32];
+        time_sync_format(timebuf, sizeof(timebuf));
+        o = sb_add(s_json, sizeof(s_json), o, ",\"time\":");
+        o = sb_json_str(s_json, sizeof(s_json), o, timebuf);
+    }
     o = sb_add(s_json, sizeof(s_json), o, "}");
 
     return send_json(req, s_json);
@@ -228,12 +244,6 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     o = sb_json_str(s_json, sizeof(s_json), o, cfg.mqtt_username);
     o = sb_add(s_json, sizeof(s_json), o, ",\"mqtt_password\":");
     o = sb_json_str(s_json, sizeof(s_json), o, cfg.mqtt_password);
-    o = sb_add(s_json, sizeof(s_json), o, ",\"mqtt_cmd_topic\":");
-    o = sb_json_str(s_json, sizeof(s_json), o, cfg.mqtt_cmd_topic);
-    o = sb_add(s_json, sizeof(s_json), o, ",\"mqtt_broadcast_topic\":");
-    o = sb_json_str(s_json, sizeof(s_json), o, cfg.mqtt_broadcast_topic);
-    o = sb_add(s_json, sizeof(s_json), o, ",\"mqtt_status_topic\":");
-    o = sb_json_str(s_json, sizeof(s_json), o, cfg.mqtt_status_topic);
     o = sb_add(s_json, sizeof(s_json), o, "}");
 
     return send_json(req, s_json);
@@ -279,15 +289,6 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     }
     if (form_get(body, "mqtt_password", tmp, sizeof(tmp))) {
         strlcpy(cfg.mqtt_password, tmp, sizeof(cfg.mqtt_password));
-    }
-    if (form_get(body, "mqtt_cmd_topic", tmp, sizeof(tmp))) {
-        strlcpy(cfg.mqtt_cmd_topic, tmp, sizeof(cfg.mqtt_cmd_topic));
-    }
-    if (form_get(body, "mqtt_broadcast_topic", tmp, sizeof(tmp))) {
-        strlcpy(cfg.mqtt_broadcast_topic, tmp, sizeof(cfg.mqtt_broadcast_topic));
-    }
-    if (form_get(body, "mqtt_status_topic", tmp, sizeof(tmp))) {
-        strlcpy(cfg.mqtt_status_topic, tmp, sizeof(cfg.mqtt_status_topic));
     }
     free(body);
 
@@ -343,12 +344,33 @@ static esp_err_t wake_get_handler(httpd_req_t *req)
     return send_json(req, resp);
 }
 
+/* GET /api/mac -> the stored MAC/IP address book (managed over MQTT). */
+static esp_err_t mac_get_handler(httpd_req_t *req)
+{
+    wm_mac_table_t table;
+    mac_store_get(&table);
+
+    int o = 0;
+    o = sb_add(s_json, sizeof(s_json), o, "{\"count\":%d,\"macs\":[", table.count);
+    for (int i = 0; i < table.count; i++) {
+        o = sb_add(s_json, sizeof(s_json), o, "%s{\"mac\":", i ? "," : "");
+        o = sb_json_str(s_json, sizeof(s_json), o, table.entries[i].mac);
+        o = sb_add(s_json, sizeof(s_json), o, ",\"ip\":");
+        o = sb_json_str(s_json, sizeof(s_json), o, table.entries[i].ip);
+        o = sb_add(s_json, sizeof(s_json), o, "}");
+    }
+    o = sb_add(s_json, sizeof(s_json), o, "]}");
+
+    return send_json(req, s_json);
+}
+
 static const httpd_uri_t s_uris[] = {
     { .uri = "/",               .method = HTTP_GET,  .handler = index_get_handler },
     { .uri = "/api/status",     .method = HTTP_GET,  .handler = status_get_handler },
     { .uri = "/api/config",     .method = HTTP_GET,  .handler = config_get_handler },
     { .uri = "/api/config",     .method = HTTP_POST, .handler = config_post_handler },
     { .uri = "/api/wake",       .method = HTTP_GET,  .handler = wake_get_handler },
+    { .uri = "/api/mac",        .method = HTTP_GET,  .handler = mac_get_handler },
 };
 
 esp_err_t control_http_start(void)

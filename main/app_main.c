@@ -21,6 +21,10 @@
 #include "led_status.h"
 #include "app_config.h"
 #include "config_store.h"
+#include "mac_store.h"
+#include "chip_temp.h"
+#include "time_sync.h"
+#include "watchdog.h"
 #include "control_http.h"
 #include "control_mqtt.h"
 
@@ -75,6 +79,19 @@ void app_main(void)
     /* Load runtime configuration (NVS, falling back to app_config.h defaults) */
     ESP_ERROR_CHECK(config_store_init());
 
+    /* Enable the task watchdog early so hangs are caught from boot onwards */
+    if (watchdog_init() != ESP_OK) {
+        ESP_LOGW(TAG, "Task watchdog could not be enabled (continuing)");
+    }
+
+    /* Load the persisted MAC/IP address book (NVS) */
+    ESP_ERROR_CHECK(mac_store_init());
+
+    /* Internal temperature sensor used for the periodic MQTT report */
+    if (chip_temp_init() != ESP_OK) {
+        ESP_LOGW(TAG, "Internal temperature sensor unavailable (continuing)");
+    }
+
     /* Initialize Wi-Fi and provisioning (or connect if already provisioned) */
     ESP_ERROR_CHECK(wifi_prov_start());
 
@@ -82,6 +99,12 @@ void app_main(void)
     wifi_prov_wait_connected();
 
     ESP_LOGI(TAG, "Free heap after Wi-Fi connected: %" PRIu32 " bytes", esp_get_free_heap_size());
+
+    /* Network is up: calibrate the clock over SNTP (non-blocking) */
+    time_sync_start();
+
+    /* From here on the main task must keep feeding the watchdog */
+    watchdog_add_current_task();
 
     /* Start the control interfaces that trigger Wake-on-LAN packets */
 #if WOL_HTTP_ENABLE
@@ -96,8 +119,9 @@ void app_main(void)
     ESP_LOGI(TAG, "WakeManager ready");
 
     /* Nothing else to do in the main task; work happens in the HTTP/MQTT
-     * handlers and the LED task. */
+     * handlers and the LED task. Keep the watchdog fed while idling. */
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
+        watchdog_feed();
     }
 }

@@ -127,11 +127,15 @@ WakeManager/
 ├── sdkconfig / sdkconfig.defaults
 ├── partitions.csv
 ├── main/
-│   └── app_main.c              # 入口：NVS/配置初始化 → Wi-Fi 配网 → 启动 HTTP/MQTT
+│   └── app_main.c              # 入口：NVS/配置初始化 → 看门狗 → Wi-Fi 配网 → 校时 → 启动 HTTP/MQTT
 └── components/                 # 每个功能模块一个组件（一模块一文件夹）
-    ├── app_config/             # 编译期默认配置（纯宏，仅头文件）
+    ├── app_config/             # 编译期默认配置（纯宏，仅头文件；含固定 MQTT 主题）
     ├── config_store/           # 运行时配置：NVS 持久化 + 互斥锁保护
+    ├── mac_store/              # MAC/IP 地址簿：最多 10 组，NVS 持久化 + 互斥锁保护
     ├── device_info/            # 设备唯一标识（Wi-Fi STA MAC → 12 位十六进制）
+    ├── chip_temp/              # 芯片内部温度传感器（temperature_sensor 驱动）
+    ├── time_sync/              # SNTP 自动校时（Wi-Fi 连接成功后启动）
+    ├── watchdog/               # 任务看门狗（esp_task_wdt）
     ├── led_status/             # LED 状态指示（连接中/已连接等）
     ├── wifi_prov/              # Wi-Fi BLE 配网
     ├── wol/                    # 魔术包构造与发送（广播地址自动推导）
@@ -152,11 +156,29 @@ WakeManager/
 | `wol_broadcast` | 广播地址；**留空或 `255.255.255.255` 时自动推导** |
 | `mqtt_enable` | 是否启用 MQTT |
 | `mqtt_uri` / `mqtt_username` / `mqtt_password` | Broker 与凭据 |
-| `mqtt_cmd_topic` | **唤醒命令主题基名**，设备实际订阅 `<它>/<设备ID>` |
-| `mqtt_broadcast_topic` | **广播主题**，所有设备都订阅，用于设备发现 |
-| `mqtt_status_topic` | 设备上报状态/结果的主题 |
 
-> ⚠️ `wm_config_t` 以 NVS blob 存储并按 `sizeof` 校验；**新增/调整字段会导致旧配置因长度不符而回退为默认值**。
+> **MQTT 主题不再是运行时可配置项**，全部固定为 `app_config.h` 中的宏：`WOL_MQTT_CMD_TOPIC`、`WOL_MQTT_BROADCAST_TOPIC`、`WOL_MQTT_STATUS_TOPIC`、`WOL_MQTT_MAC_TOPIC`、`WOL_MQTT_MAC_GET_TOPIC`、`WOL_MQTT_TEMP_TOPIC`。网页 UI 与 `/api/config` 已移除主题字段（升级后旧配置因 blob 长度变化会回退默认值）。
+
+## MAC/IP 地址簿（mac_store）
+
+`components/mac_store`：
+
+- 最多存 **10 组** MAC + IP，整体以单个 blob 存于 NVS 命名空间 `wm_mac`（key `list`），互斥锁保护。
+- MAC 统一规范化为 `AA:BB:CC:DD:EE:FF`；IP 可为空（唤醒时走默认广播）。
+- API：`mac_store_init()`、`mac_store_count()`、`mac_store_get()`、`mac_store_set(mac, ip)`、`mac_store_remove(mac)`、`mac_store_clear()`、`mac_store_get_ip(mac, ...)`。
+- 唤醒命令只给 `mac` 时，会自动用地址簿里该 MAC 存的 IP 作为目标（未命中则用默认广播）。
+
+## 芯片温度（chip_temp）
+
+`components/chip_temp`：封装 `esp_driver_tsens` 的内部温度传感器，`chip_temp_init()`（开机初始化一次）、`chip_temp_read(&celsius)`。
+
+## 时间同步（time_sync）
+
+`components/time_sync`：Wi-Fi 拿到 IP 后调用 `time_sync_start()`，通过 SNTP 校时；服务器与 POSIX 时区分别由 `NTP_SERVER`、`TIME_TIMEZONE`（默认 `pool.ntp.org` / `CST-8`）固定。`time_sync_is_synced()` 判断是否已同步，`time_sync_format()` 输出本地时间字符串。
+
+## 看门狗（watchdog）
+
+`components/watchdog`：`watchdog_init()` 配置并开启任务看门狗（`esp_task_wdt`，超时 `WATCHDOG_TIMEOUT_MS`，`WATCHDOG_TRIGGER_PANIC` 决定超时是否复位），监控各核 idle 任务；主任务在 Wi-Fi 连接后 `watchdog_add_current_task()` 订阅并在循环中 `watchdog_feed()`。中断看门狗由 Kconfig `CONFIG_ESP_INT_WDT`（默认开）控制，无需运行时配置。
 
 ## 网络唤醒（WOL）行为
 
@@ -175,34 +197,46 @@ WakeManager/
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | 内嵌单页 UI |
-| GET | `/api/status` | 状态 JSON：`id`、`ip`、`ssid`、`rssi`、`heap`、`mqtt_connected`、`default_mac`、`broadcast` |
+| GET | `/api/status` | 状态 JSON：`id`、`ip`、`ssid`、`rssi`、`heap`、`mqtt_connected`、`default_mac`、`broadcast`、`mac_count`、`temp_c`、`time` |
 | GET | `/api/config` | 当前配置 JSON |
 | POST | `/api/config` | 保存配置（`x-www-form-urlencoded`），随后重载 MQTT |
 | GET | `/api/wake` | 发送魔术包，可选 `?mac=<MAC>&ip=<IP>` |
+| GET | `/api/mac` | 地址簿 JSON：`{"count":n,"macs":[{"mac":...,"ip":...}]}`（增删改经 MQTT） |
 
 ## MQTT 协议
 
 `components/wol_mqtt`。设备 ID（`id`）= Wi-Fi STA MAC 的 12 位大写十六进制，如 `A1B2C3D4E5F6`。
 
-**订阅两个主题：**
+**订阅四个主题**（主题全部固定，`<id>` = 设备 ID）：
 
-1. **广播主题**（共享，`mqtt_broadcast_topic`，默认 `wakemanager/broadcast`）
+1. **广播主题**（共享，`WOL_MQTT_BROADCAST_TOPIC` = `wakemanager/broadcast`）
    - 所有设备都订阅；远程在不知道任何设备 ID 时用它做**设备发现**。
    - 收到 `{"cmd":"status"}`（或缺省 `cmd`）→ 立即把自身状态（含 `id`）发布到状态主题。
    - **不接受唤醒命令**。
 
-2. **唤醒主题**（每设备独立，`<mqtt_cmd_topic>/<id>`，如 `wakemanager/cmd/A1B2C3D4E5F6`）
+2. **唤醒主题**（每设备，`WOL_MQTT_CMD_TOPIC` + `/<id>`，如 `wakemanager/cmd/A1B2C3D4E5F6`）
    - 唤醒命令：`{"cmd":"wake","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}`
-   - `mac`/`ip` 均可选：省略 `mac` 用默认目标，省略 `ip` 用默认广播地址。
+   - `mac`/`ip` 均可选：省略 `mac` 用默认目标，省略 `ip` 优先用地址簿中该 MAC 存的 IP、否则用默认广播地址。
 
-**发布：** 状态/结果发布到 `mqtt_status_topic`。
+3. **地址簿设置主题**（每设备，`WOL_MQTT_MAC_TOPIC` + `/<id>`，如 `wakemanager/mac/A1B2C3D4E5F6`）
+   - 新增/更新：`{"cmd":"set","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.5"}`（`add`/`update` 同义）
+   - 删除：`{"cmd":"del","mac":"AA:BB:CC:DD:EE:FF"}`（`delete`/`remove` 同义）
+   - 清空：`{"cmd":"clear"}`
+   - 结果发布到状态主题（`ok: mac stored` / `error: address book full` 等）。
+
+4. **地址簿获取主题**（每设备，`WOL_MQTT_MAC_GET_TOPIC` + `/<id>`，如 `wakemanager/mac/get/A1B2C3D4E5F6`）
+   - 收到 `{"cmd":"get"}`（或空消息）→ 把完整列表发布到状态主题。
+   - 列表 JSON：`{"id":"A1B2C3D4E5F6","cmd":"mac_list","count":2,"macs":[{"mac":"AA:BB:...","ip":"192.168.1.5"},...]}`
+
+**发布：** 命令结果、发现应答、地址簿列表发布到 `WOL_MQTT_STATUS_TOPIC`（`wakemanager/status`）；芯片温度发布到 `WOL_MQTT_TEMP_TOPIC` + `/<id>`（如 `wakemanager/temp/A1B2C3D4E5F6`），**每 60 秒一次**：`{"id":"A1B2C3D4E5F6","temp_c":41.25}`。
 
 **状态上报 JSON 示例：**
 
 ```json
 {"id":"A1B2C3D4E5F6","ip":"192.168.1.88","ssid":"MyWiFi","rssi":-52,
  "heap":123456,"default_mac":"AA:BB:CC:DD:EE:FF",
- "broadcast":"192.168.1.255","mqtt_connected":true}
+ "broadcast":"192.168.1.255","mqtt_connected":true,
+ "mac_count":2,"temp_c":41.25,"time":"2026-10-10 20:30:00"}
 ```
 
 **典型流程（远程不知道设备 ID）：**
@@ -211,6 +245,8 @@ WakeManager/
 1) 远程 publish  广播主题        {"cmd":"status"}
 2) 各设备 publish 状态主题        {... "id":"A1B2C3D4E5F6" ...}   ← 取得设备 ID
 3) 远程 publish  wakemanager/cmd/A1B2C3D4E5F6   {"cmd":"wake","mac":"..."}
+4) 远程 publish  wakemanager/mac/A1B2C3D4E5F6   {"cmd":"set","mac":"...","ip":"..."}
+5) 远程 publish  wakemanager/mac/get/A1B2C3D4E5F6  {"cmd":"get"}
 ```
 
 **命令格式仅支持 JSON**（不再支持纯文本）。
@@ -221,15 +257,19 @@ WakeManager/
 - 头文件统一 `#pragma once`，并以 `extern "C"` 包裹，便于将来 C++ 调用。
 - 每个源文件用 `static const char *TAG = "...";` 配合 `ESP_LOGI/W/E` 打日志。
 - 新增对外 API 时同步更新头文件注释（Doxygen 风格）。
-- 配置读写一律走 `config_store_get/save`（内部有互斥锁），不要直接读 NVS。
+- 配置读写一律走 `config_store_get/save`；地址簿读写一律走 `mac_store_*`（均内部加锁），不要直接读 NVS。
 
 ## 开发经验 / 注意事项
 
 - **IDF v6.1 移除了内置 cJSON**：需通过 `idf_component.yml` 声明 `espressif/cjson` 托管组件，`#include "cJSON.h"` 才可用。
 - **托管组件依赖**：在组件的 `idf_component.yml` 中声明后会自动加入依赖，**无需**写进 `CMakeLists.txt` 的 `REQUIRES`；但直接 `#include` 的核心组件（如 `esp_netif`、`esp_wifi`）**必须**写入 `REQUIRES`。
+- **组件名**：日志组件叫 `log`（不是 `esp_log`）；温度传感器驱动组件叫 `esp_driver_tsens`；任务看门狗头文件 `esp_task_wdt.h` 在 `esp_system`。
 - **MINIMAL_BUILD = ON**：新组件必须被 `main` 依赖链引用才会参与构建。
 - **MQTT 数据不是 NUL 结尾**：`event->topic` / `event->data` 需按长度处理，日志用 `%.*s` 打印，避免越界。
-- **配置结构变更**：`wm_config_t` 是整体 blob，改字段会使旧配置失效并回退默认值，升级时需知悉。
+- **MQTT 主题固定**：主题是 `app_config.h` 的宏，不再进 `config_store`，也不在网页 UI 配置；每设备主题 = 基名 + `/<设备ID>`。
+- **配置结构变更**：`wm_config_t` 是整体 blob，改字段会使旧配置失效并回退默认值，升级时需知悉（本次移除主题字段即属此类）。
+- **看门狗**：`watchdog_init()` 会 `reconfigure`（IDF 默认已 `CONFIG_ESP_TASK_WDT_INIT` 自动初始化），监控各核 idle 任务，`WATCHDOG_TRIGGER_PANIC=1` 时超时复位。若任务可能长时间阻塞（如等待配网），**不要**提前把它加入看门狗，应在开始循环喂狗后再 `watchdog_add_current_task()`。
+- **SNTP**：`esp_sntp.h` 由 `lwip` 组件提供，需 `CONFIG_LWIP_SNTP_*`（默认开启）；时区用 `setenv("TZ", ...)` + `tzset()` 设置。
 - **广播地址**：仅在配置为空或 `255.255.255.255` 时自动推导；填具体地址即覆盖。
 - **本机构建**：`idf.py` 不在 PATH，需用 `python "$IDF_PATH/tools/idf.py"` 调用。
 ```

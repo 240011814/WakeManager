@@ -33,7 +33,10 @@
 #define WOL_MQTT_CLIENT_ID      "wakemanager"
 #define WOL_MQTT_USERNAME       ""      /* leave empty for anonymous */
 #define WOL_MQTT_PASSWORD       ""      /* leave empty for anonymous */
-/* Wake command topic. Each device subscribes to "<topic>/<device_id>", where
+
+/* MQTT topics are fixed at build time (not user configurable).
+ *
+ * Wake command topic. Each device subscribes to "<topic>/<device_id>", where
  * <device_id> is the Wi-Fi station MAC as 12 hex chars (e.g. A1B2C3D4E5F6), so
  * wake commands are addressed to a single device:
  *   {"cmd":"wake","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}
@@ -50,6 +53,41 @@
 #define WOL_MQTT_BROADCAST_TOPIC "wakemanager/broadcast"
 /* Device publishes its results/status here */
 #define WOL_MQTT_STATUS_TOPIC   "wakemanager/status"
+
+/* MAC/IP address book topic. Per-device: the device subscribes to
+ * "<topic>/<device_id>" and accepts:
+ *   {"cmd":"set","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.5"}
+ *   {"cmd":"del","mac":"AA:BB:CC:DD:EE:FF"}     (aliases: delete/remove)
+ *   {"cmd":"clear"}
+ * At most WM_MAC_STORE_MAX (10) entries are kept. Results go to the status
+ * topic. */
+#define WOL_MQTT_MAC_TOPIC      "wakemanager/mac"
+/* MAC/IP address book query topic. Per-device: the device subscribes to
+ * "<topic>/<device_id>" and replies on the status topic with the full list:
+ *   {"cmd":"get"}     (a missing/empty "cmd" also triggers the reply) */
+#define WOL_MQTT_MAC_GET_TOPIC  "wakemanager/mac/get"
+/* Chip temperature report topic. The device publishes
+ * "<topic>/<device_id>" once per minute with its internal temperature:
+ *   {"id":"A1B2C3D4E5F6","temp_c":41.25} */
+#define WOL_MQTT_TEMP_TOPIC     "wakemanager/temp"
+
+/* ---------- Time sync (SNTP) ---------- */
+
+/* NTP server used to calibrate the clock after Wi-Fi connects. */
+#define NTP_SERVER              "pool.ntp.org"
+/* POSIX timezone string (e.g. "CST-8" for UTC+8, "UTC0" for UTC). */
+#define TIME_TIMEZONE           "CST-8"
+
+/* ---------- Watchdog ---------- */
+
+/* Task watchdog timeout. Subscribed tasks must feed it within this window or,
+ * when WATCHDOG_TRIGGER_PANIC is 1, the device panics and reboots. */
+#define WATCHDOG_TIMEOUT_MS     30000
+#define WATCHDOG_TRIGGER_PANIC  1
+
+/* ---------- Internal temperature reporting ---------- */
+
+#define TEMP_REPORT_INTERVAL_MS 60000
 
 /* ---------- Wi-Fi provisioning (BLE transport) ---------- */
 

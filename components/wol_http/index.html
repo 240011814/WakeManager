@@ -48,6 +48,8 @@
       <div class="k">信号</div><div id="st_rssi">-</div>
       <div class="k">空闲堆</div><div id="st_heap">-</div>
       <div class="k">MQTT</div><div id="st_mqtt">-</div>
+      <div class="k">芯片温度</div><div id="st_temp">-</div>
+      <div class="k">时间</div><div id="st_time">-</div>
       <div class="k">广播地址</div><div id="st_bcast">-</div>
     </div>
   </div>
@@ -60,6 +62,12 @@
     <input type="text" id="wakeIp" placeholder="自动（留空）" autocomplete="off">
     <div class="row"><button onclick="wake()">发送魔术包</button></div>
     <div class="msg" id="wakeMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>MAC 地址簿</h2>
+    <div class="grid" id="macList"><div class="k">-</div><div>暂无</div></div>
+    <div class="msg">最多 10 组，通过 MQTT 主题管理（每设备 <code>wakemanager/mac/&lt;设备ID&gt;</code>）。</div>
   </div>
 
   <form class="card" id="cfgForm">
@@ -84,12 +92,7 @@
       <input type="text" name="mqtt_username" autocomplete="off">
       <label>密码</label>
       <input type="password" name="mqtt_password" autocomplete="new-password">
-      <label>唤醒命令主题（实际订阅为 <code>主题/设备ID</code>）</label>
-      <input type="text" name="mqtt_cmd_topic" placeholder="wakemanager/cmd" autocomplete="off">
-      <label>广播主题（所有设备都订阅，用于发现设备ID）</label>
-      <input type="text" name="mqtt_broadcast_topic" placeholder="wakemanager/broadcast" autocomplete="off">
-      <label>状态主题</label>
-      <input type="text" name="mqtt_status_topic" placeholder="wakemanager/status" autocomplete="off">
+      <p class="msg">MQTT 主题固定为代码常量，不可在此配置。</p>
     </fieldset>
 
     <div class="row"><button type="submit">保存配置</button></div>
@@ -117,7 +120,24 @@ async function refreshStatus() {
     $('st_mqtt').innerHTML = s.mqtt_connected
       ? '<span class="badge on">已连接</span>'
       : '<span class="badge off">未连接</span>';
+    $('st_temp').textContent = (typeof s.temp_c === 'number')
+      ? s.temp_c.toFixed(2) + ' °C' : '-';
+    $('st_time').textContent = s.time || '(未同步)';
     $('st_bcast').textContent = s.broadcast || '-';
+  } catch (e) { /* ignore transient errors */ }
+}
+
+async function refreshMac() {
+  try {
+    const m = await (await fetch('/api/mac')).json();
+    const el = $('macList');
+    if (!m.macs || m.macs.length === 0) {
+      el.innerHTML = '<div class="k">-</div><div>暂无</div>';
+      return;
+    }
+    el.innerHTML = m.macs.map(x =>
+      '<div class="k">' + x.mac + '</div><div>' + (x.ip || '默认广播') + '</div>'
+    ).join('');
   } catch (e) { /* ignore transient errors */ }
 }
 
@@ -131,9 +151,6 @@ async function loadConfig() {
     form.mqtt_uri.value = c.mqtt_uri || '';
     form.mqtt_username.value = c.mqtt_username || '';
     form.mqtt_password.value = c.mqtt_password || '';
-    form.mqtt_cmd_topic.value = c.mqtt_cmd_topic || '';
-    form.mqtt_broadcast_topic.value = c.mqtt_broadcast_topic || '';
-    form.mqtt_status_topic.value = c.mqtt_status_topic || '';
   } catch (e) { setMsg($('saveMsg'), '读取配置失败', false); }
 }
 
@@ -159,9 +176,6 @@ form.addEventListener('submit', async e => {
   p.set('mqtt_uri', form.mqtt_uri.value.trim());
   p.set('mqtt_username', form.mqtt_username.value);
   p.set('mqtt_password', form.mqtt_password.value);
-  p.set('mqtt_cmd_topic', form.mqtt_cmd_topic.value.trim());
-  p.set('mqtt_broadcast_topic', form.mqtt_broadcast_topic.value.trim());
-  p.set('mqtt_status_topic', form.mqtt_status_topic.value.trim());
   try {
     const r = await fetch('/api/config', {
       method: 'POST',
@@ -175,7 +189,9 @@ form.addEventListener('submit', async e => {
 
 refreshStatus();
 loadConfig();
+refreshMac();
 setInterval(refreshStatus, 3000);
+setInterval(refreshMac, 10000);
 </script>
 </body>
 </html>
