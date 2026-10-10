@@ -3,8 +3,9 @@
 基于官方 [`esp-idf-template`](https://github.com/esp-rs/esp-idf-template)（std 路线）
 + `esp-idf-svc` 0.53 的 WakeManager 重写，目标芯片 ESP32-S3，ESP-IDF v6.1。
 
-当前阶段：**P1+P2 完整移植** — 全部业务模块已从 C 版移植（配置/地址簿/WOL/HTTP/MQTT/
-LED/看门狗/SNTP/温度），BLE 配网沿用 P3 已验证的 FFI 方案。
+当前阶段：**完整移植，C 版已移除** — 全部业务模块已从 C 版移植（配置/地址簿/WOL/HTTP/MQTT/
+LED/看门狗/SNTP/温度），BLE 配网沿用已验证的 FFI 方案。内嵌 Web UI `index.html`
+已随迁移移入 `src/index.html`（`control_http.rs` 用 `include_str!("index.html")` 内嵌）。
 
 ## 模块对照（C → Rust）
 
@@ -20,10 +21,11 @@ LED/看门狗/SNTP/温度），BLE 配网沿用 P3 已验证的 FFI 方案。
 | `watchdog.c` | `src/watchdog.rs` | esp_task_wdt FFI |
 | `led_status.c` | `src/led_status.rs` | GPIO FFI + 独立线程 |
 | `wifi_prov.c` | `src/wifi_prov.rs` | network_provisioning FFI（P3 已验证） |
-| `control_http.c` | `src/control_http.rs` | `EspHttpServer`（index.html include_str 内嵌） |
-| `control_mqtt.c` | `src/control_mqtt.rs` | `EspMqttClient`（回调）+ FFI publish/subscribe |
+| `control_http.c` | `src/control_http.rs` | `EspHttpServer`（专属线程持有；index.html include_str 内嵌） |
+| `control_mqtt.c` | `src/control_mqtt.rs` | `EspMqttClient::new` + 事件循环线程（阻塞 `connection.next()`） |
 | `app_main.c` | `src/main.rs` | 编排入口 |
-| （status 快照辅助） | `src/netinfo.rs` | netif/wifi FFI |
+| （status 快照辅助） | `src/status.rs` | 状态/配置/地址簿的 `serde` 视图（JSON） |
+| （netif/wifi 查询） | `src/netinfo.rs` | netif/wifi FFI |
 
 JSON 构造统一用 `serde_json`（替代 C 的手写 sb_add / cJSON）。
 
@@ -104,7 +106,7 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
 
 ## 验证清单（P1+P2 完整移植，2026-10-10 真机通过）
 
-- [x] `cargo build` 编译通过（0 错误；16 个 dead-code/命名风格警告）
+- [x] `cargo build` 编译通过（0 错误、0 警告）
 - [x] 烧录后启动：chip info → LED → NVS → 配置/地址簿/看门狗/温度 →
       `Device is already provisioned, starting Wi-Fi STA` → IP 172.16.9.207
 - [x] **NVS blob 兼容**：C 固件的地址簿（1 条 `64:4E:D7:67:FB:0E`）与默认配置被 Rust 固件直接读取
@@ -119,7 +121,17 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
 - [ ] BLE 重新配网（需手机 ESP Provisioning App：先擦除 NVS 命名空间 `wifi.prov`）
 
 > 注：`partitions.csv` 的 factory 分区从 0x180000 扩到 0x300000（Rust 镜像 1.8MB 超过
-> 1.5MB；C 固件共享该表，扩分区对 C 无影响）。
+> 1.5MB）。
+
+## 优化记录（2026-10-10）
+
+在保持报文/行为与 C 版一致的前提下做了一轮代码优化（详见 `CLAUDE.md` 的「开发经验」）：
+
+- JSON 构造改为 `serde` 派生结构体，统一放在 `src/status.rs`（`temp_c`/`time` 按需省略）。
+- `control_mqtt` 改为 `EspMqttClient::new` + 专属事件循环线程，移除 `AtomicPtr` + 回调内裸 FFI。
+- `control_http` 的 `EspHttpServer` 改由专属线程创建并持有，移除 `unsafe impl Send/Sync`。
+- `wifi_prov` 的 `WIFI_INIT_CONFIG_DEFAULT()` 字段改用 esp-idf-sys 常量（修正了原先 `feature_caps` 硬编码为 1 的偏差）；`wait_connected()` 改用 `Condvar`。
+- `device_info::get_mac()` 返回 `Result`；HTTP 表单读取校验长度；`truncate()` 按字节并保证 UTF-8 边界。
 
 ## 目录
 
@@ -138,12 +150,14 @@ wol-rs/
     ├── mac_store.rs        # NVS 地址簿（blob 341B 与 C 逐字节兼容）
     ├── device_info.rs      # MAC / 设备 id
     ├── netinfo.rs          # IP/掩码/SSID/RSSI/空闲堆
+    ├── status.rs           # 状态/配置/地址簿的 serde 视图（JSON）
     ├── wol.rs              # magic packet（std UdpSocket）+ 子网广播推导
     ├── chip_temp.rs        # 片内温度（temperature_sensor FFI）
     ├── time_sync.rs        # SNTP（esp_sntp FFI）
     ├── watchdog.rs         # TWDT（esp_task_wdt FFI）
     ├── led_status.rs       # GPIO48 + 独立线程（FFI + std thread）
     ├── wifi_prov.rs        # BLE 配网（network_provisioning FFI，P3 已验证）
+    ├── index.html          # 内嵌单页 Web UI（原 components/wol_http/index.html）
     ├── control_http.rs     # EspHttpServer（index.html include_str 内嵌）
     └── control_mqtt.rs     # EspMqttClient 回调 + FFI publish/subscribe
 ```

@@ -14,6 +14,7 @@ mod device_info;
 mod led_status;
 mod mac_store;
 mod netinfo;
+mod status;
 mod time_sync;
 mod watchdog;
 mod wifi_prov;
@@ -24,14 +25,6 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::*;
 
 use app_config as ac;
-
-/// 对应 C 版 ESP_ERROR_CHECK：失败即中止（看门狗/重启策略与 C 版一致）
-fn check(err: esp_err_t, ctx: &str) {
-    if err != ESP_OK {
-        ::log::error!("{ctx} failed: {err:#x}");
-        std::process::abort();
-    }
-}
 
 /// 对应 esp_chip_info.h 中的 `CHIP_FEATURE_*` 宏（含移位表达式，bindgen 不翻译）
 const CHIP_FEATURE_WIFI_BGN: u32 = 1 << 0;

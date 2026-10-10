@@ -2,41 +2,35 @@
 //! 对应 C 版 `components/wol_http/control_http.c`
 //!
 //! 路由：
-//!   GET  /              -> index.html（内嵌，来自 C 版同文件）
+//!   GET  /              -> index.html（内嵌）
 //!   GET  /api/status    -> JSON 状态
 //!   GET  /api/config    -> JSON 配置
 //!   POST /api/config    -> 保存配置（x-www-form-urlencoded）+ 重启 MQTT
-//!   GET  /api/wake      -> 发送 magic packet（可带 ?mac= ?ip=）
+//!   GET  /api/wake      -> 发送 magic packet（?mac= 必传，?ip= 可选）
 //!   GET  /api/mac       -> MAC/IP 地址簿
-
-use std::sync::Mutex;
+//!
+//! 服务器由专属线程创建并持有（线程内 `EspHttpServer` 不跨线程移动，
+//! 因此无需 `unsafe impl Send/Sync`）。
 
 use esp_idf_svc::http::server::{
     Configuration, EspHttpConnection, EspHttpServer, Method, Request,
 };
 use esp_idf_svc::io::EspIOError;
+use esp_idf_svc::sys::{EspError, ESP_FAIL};
+
+use serde::Serialize;
 
 use crate::app_config as ac;
-use crate::chip_temp;
 use crate::config_store;
 use crate::control_mqtt;
-use crate::device_info;
-use crate::mac_store;
-use crate::netinfo;
-use crate::time_sync;
+use crate::status;
 use crate::wol;
 
-/// 内嵌 Web UI（与 C 版 components/wol_http/index.html 同一文件）
-static INDEX_HTML: &str = include_str!("../../components/wol_http/index.html");
+/// 内嵌 Web UI（从 C 版 components/wol_http/index.html 迁移而来，随 crate 一起版本化）
+static INDEX_HTML: &str = include_str!("index.html");
 
-/// HTTP 服务保持存活（httpd 任务在注册的闭包里运行）。
-/// EspHttpServer 内含裸指针（非 Send/Sync），用新类型包装：
-/// 所有访问都在 Mutex 下串行化，httpd 内部自身线程安全。
-struct ServerHolder(EspHttpServer<'static>);
-unsafe impl Send for ServerHolder {}
-unsafe impl Sync for ServerHolder {}
-
-static SERVER: Mutex<Option<ServerHolder>> = Mutex::new(None);
+/// 保持服务器存活的线程栈大小。
+const HTTPD_OWNER_STACK: usize = 8192;
 
 /* ---------------- small helpers ---------------- */
 
@@ -68,7 +62,7 @@ fn url_decode(src: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// 解析 urlencoded 查询串 / 表单体为 (key, decoded value) 列表
+/// 解析 urlencoded 键值串为 (key, decoded value) 列表
 fn parse_params(text: &str) -> Vec<(String, String)> {
     text.split('&')
         .filter(|p| !p.is_empty())
@@ -79,6 +73,17 @@ fn parse_params(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// 从请求 URI 中取出查询串并解析为参数列表。
+///
+/// esp-idf-svc 0.53 的 `Request` 只有 `uri()`（含查询串）、没有独立的
+/// `query()`，因此这里统一封装查询串的切分与解码。
+fn query_params(uri: &str) -> Vec<(String, String)> {
+    match uri.split_once('?') {
+        Some((_, q)) => parse_params(q),
+        None => Vec::new(),
+    }
+}
+
 fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
     params
         .iter()
@@ -86,9 +91,20 @@ fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// 等价 strlcpy 截断
+/// 等价 strlcpy 截断：最多 `cap - 1` 个**字节**，并对齐 UTF-8 边界。
 fn truncate(s: &str, cap: usize) -> String {
-    s.chars().take(cap - 1).collect()
+    if cap == 0 {
+        return String::new();
+    }
+    let max = cap - 1;
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 fn respond(
@@ -138,32 +154,16 @@ fn send_err(
     )
 }
 
-/// 对应 C 版 status_get_handler 的 JSON 构造
-fn status_json() -> String {
-    let mut m = serde_json::Map::new();
-    m.insert("id".into(), device_info::get_id().into());
-    m.insert("ip".into(), netinfo::sta_ip().into());
-    match netinfo::sta_ssid_rssi() {
-        Some((ssid, rssi)) => {
-            m.insert("ssid".into(), ssid.into());
-            m.insert("rssi".into(), (rssi as i64).into());
-        }
-        None => {
-            m.insert("ssid".into(), "".into());
-            m.insert("rssi".into(), 0.into());
-        }
-    }
-    m.insert("heap".into(), (netinfo::free_heap() as u64).into());
-    m.insert("mqtt_connected".into(), control_mqtt::is_connected().into());
-    m.insert("broadcast".into(), wol::get_default_broadcast().into());
-    m.insert("mac_count".into(), (mac_store::count() as u64).into());
-    if let Ok(c) = chip_temp::read() {
-        m.insert("temp_c".into(), (c as f64).into());
-    }
-    if time_sync::is_synced() {
-        m.insert("time".into(), time_sync::format_now().into());
-    }
-    serde_json::Value::Object(m).to_string()
+#[derive(Serialize)]
+struct WakeResponse {
+    ok: bool,
+    mac: String,
+    ip: String,
+}
+
+#[derive(Serialize)]
+struct OkResponse {
+    ok: bool,
 }
 
 /* ---------------- handlers ---------------- */
@@ -179,19 +179,12 @@ fn index_get(request: Request<&mut EspHttpConnection<'_>>) -> Result<(), EspIOEr
 }
 
 fn status_get(request: Request<&mut EspHttpConnection<'_>>) -> Result<(), EspIOError> {
-    send_json(request, &status_json())
+    send_json(request, &status::device_status_json())
 }
 
 fn config_get(request: Request<&mut EspHttpConnection<'_>>) -> Result<(), EspIOError> {
     let cfg = config_store::get();
-    let m = serde_json::json!({
-        "wol_udp_port": cfg.wol_udp_port,
-        "mqtt_enable": cfg.mqtt_enable,
-        "mqtt_uri": cfg.mqtt_uri,
-        "mqtt_username": cfg.mqtt_username,
-        "mqtt_password": cfg.mqtt_password,
-    });
-    send_json(request, &m.to_string())
+    send_json(request, &status::config_json(&cfg))
 }
 
 fn config_post(mut request: Request<&mut EspHttpConnection<'_>>) -> Result<(), EspIOError> {
@@ -213,6 +206,10 @@ fn config_post(mut request: Request<&mut EspHttpConnection<'_>>) -> Result<(), E
             Err(_) => return send_err(request, 400, "Bad Request", "Missing body"),
         }
     }
+    // 校验读满，避免用不完整的表单覆盖配置
+    if body.len() != len {
+        return send_err(request, 400, "Bad Request", "Missing body");
+    }
     let body = String::from_utf8_lossy(&body).into_owned();
     let params = parse_params(&body);
 
@@ -226,10 +223,7 @@ fn config_post(mut request: Request<&mut EspHttpConnection<'_>>) -> Result<(), E
         cfg.wol_udp_port = p as u16;
     }
     if let Some(v) = get_param(&params, "mqtt_enable") {
-        cfg.mqtt_enable = matches!(
-            v.chars().next(),
-            Some('1' | 't' | 'T' | 'y' | 'Y')
-        );
+        cfg.mqtt_enable = matches!(v.chars().next(), Some('1' | 't' | 'T' | 'y' | 'Y'));
     }
     if let Some(v) = get_param(&params, "mqtt_uri") {
         cfg.mqtt_uri = truncate(v, ac::WM_CFG_HOST_LEN);
@@ -249,15 +243,13 @@ fn config_post(mut request: Request<&mut EspHttpConnection<'_>>) -> Result<(), E
     // 立即应用 MQTT 变更
     control_mqtt::restart();
 
-    send_json(request, "{\"ok\":true}")
+    let resp = serde_json::to_string(&OkResponse { ok: true }).unwrap_or_else(|_| "{}".to_string());
+    send_json(request, &resp)
 }
 
 fn wake_get(request: Request<&mut EspHttpConnection<'_>>) -> Result<(), EspIOError> {
     // uri() 含查询串（与 C 版 req->uri 一致）
-    let params: Vec<(String, String)> = match request.uri().split_once('?') {
-        Some((_, q)) => parse_params(q),
-        None => Vec::new(),
-    };
+    let params = query_params(request.uri());
     // 对应 C 版缓冲区上限：mac 17 字符 / ip 15 字符
     let mac_str = get_param(&params, "mac").map(|v| truncate(v, ac::WM_CFG_MAC_LEN));
     let ip_str = get_param(&params, "ip").map(|v| truncate(v, ac::WM_MAC_IP_LEN));
@@ -271,33 +263,29 @@ fn wake_get(request: Request<&mut EspHttpConnection<'_>>) -> Result<(), EspIOErr
         return send_err(request, 400, "Bad Request", "Failed to send magic packet");
     }
 
-    let resp = serde_json::json!({ "ok": true, "mac": mac, "ip": ip });
-    send_json(request, &resp.to_string())
+    let resp = serde_json::to_string(&WakeResponse {
+        ok: true,
+        mac,
+        ip,
+    })
+    .unwrap_or_else(|_| "{}".to_string());
+    send_json(request, &resp)
 }
 
 fn mac_get(request: Request<&mut EspHttpConnection<'_>>) -> Result<(), EspIOError> {
-    let table = mac_store::get();
-    let m = serde_json::json!({
-        "count": table.entries.len(),
-        "macs": table
-            .entries
-            .iter()
-            .map(|e| serde_json::json!({ "mac": e.mac, "ip": e.ip }))
-            .collect::<Vec<_>>(),
-    });
-    send_json(request, &m.to_string())
+    send_json(request, &status::mac_list_http_json())
 }
 
-/// 对应 C 版 `control_http_start()`
-pub fn start() -> Result<(), esp_idf_svc::sys::EspError> {
+/* ---------------- server ---------------- */
+
+fn build_server() -> Result<EspHttpServer<'static>, EspError> {
     let config = Configuration {
         http_port: ac::WOL_HTTP_PORT,
         lru_purge_enable: true,
         max_uri_handlers: 6,
         ..Default::default()
     };
-    let mut server = EspHttpServer::new(&config)
-        .map_err(|esp_idf_svc::io::EspIOError(e)| e)?;
+    let mut server = EspHttpServer::new(&config).map_err(|EspIOError(e)| e)?;
 
     server.fn_handler("/", Method::Get, index_get)?;
     server.fn_handler("/api/status", Method::Get, status_get)?;
@@ -306,23 +294,33 @@ pub fn start() -> Result<(), esp_idf_svc::sys::EspError> {
     server.fn_handler("/api/wake", Method::Get, wake_get)?;
     server.fn_handler("/api/mac", Method::Get, mac_get)?;
 
-    log::info!(
-        "HTTP control server started on port {}",
-        ac::WOL_HTTP_PORT
-    );
-
-    *SERVER.lock().unwrap() = Some(ServerHolder(server));
-    Ok(())
+    Ok(server)
 }
 
-/// 对应 C 版 `control_http_stop()`
-pub fn stop() {
-    if SERVER.lock().unwrap().take().is_some() {
-        log::info!("HTTP control server stopped");
-    }
-}
+/// 对应 C 版 `control_http_start()`：在专属线程里启动并持有服务器。
+pub fn start() -> Result<(), EspError> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), EspError>>();
 
-/// 状态指示：HTTP 已启动（供主流程日志使用）
-pub fn is_running() -> bool {
-    SERVER.lock().unwrap().is_some()
+    std::thread::Builder::new()
+        .name("httpd_owner".into())
+        .stack_size(HTTPD_OWNER_STACK)
+        .spawn(move || match build_server() {
+            Ok(server) => {
+                log::info!("HTTP control server started on port {}", ac::WOL_HTTP_PORT);
+                let _ = tx.send(Ok(()));
+                // 服务器由本线程持有；线程不退出 → 服务器一直存活。
+                let _server = server;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(3600));
+                }
+            }
+            Err(e) => {
+                log::error!("HTTP control server failed to start: {e:?}");
+                let _ = tx.send(Err(e));
+            }
+        })
+        .map_err(|_| EspError::from_infallible::<ESP_FAIL>())?;
+
+    rx.recv()
+        .unwrap_or(Err(EspError::from_infallible::<ESP_FAIL>()))
 }

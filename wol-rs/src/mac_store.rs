@@ -31,6 +31,7 @@ pub struct MacTable {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Storage 字段随 Debug 输出使用
 pub enum MacError {
     Invalid,
     NotFound,

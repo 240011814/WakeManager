@@ -1,53 +1,59 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-H21 | ESP32-H4 | ESP32-P4 | ESP32-S2 | ESP32-S3 | ESP32-S31 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | --------- | -------- | -------- | -------- | -------- | --------- | ----- |
+# WakeManager
 
-# Hello World Example
+基于 **ESP32-S3** 的网络唤醒（Wake-on-LAN）控制器：BLE 配网接入 Wi-Fi 后，通过
+HTTP（单页 Web UI + REST API）与 MQTT 远程唤醒主机、管理 MAC/IP 地址簿、上报设备状态。
 
-Starts a FreeRTOS task to print "Hello World".
+项目已从 C（ESP-IDF / FreeRTOS）**完整改写为 Rust**（`esp-idf-svc`，std 路线），
+ESP-IDF v6.1，目标芯片 ESP32-S3。原 C 实现已移除。
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
-
-## How to use example
-
-Follow detailed instructions provided specifically for this example.
-
-Select the instructions depending on Espressif chip installed on your development board:
-
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
-
-
-## Example folder contents
-
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
-
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
-
-Below is short explanation of remaining files in the project folder.
+## 目录结构
 
 ```
-├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
-├── main
-│   ├── CMakeLists.txt
-│   └── hello_world_main.c
-└── README.md                  This is the file you are currently reading
+WakeManager/
+├── partitions.csv        # 分区表（factory 0x300000，烧录时显式传入）
+├── CLAUDE.md             # 项目说明 / 开发注意事项
+└── wol-rs/               # Rust 固件工程（cargo 项目）
+    ├── Cargo.toml
+    ├── build.rs
+    ├── bindings.h        # bindgen 入口（network_provisioning 等）
+    ├── sdkconfig.defaults
+    └── src/              # 全部业务模块（config/mac/wol/http/mqtt/led/wifi…）
 ```
 
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
+## 构建与烧录
 
-## Troubleshooting
+详见 [`wol-rs/README.md`](wol-rs/README.md)。简述：
 
-* Program upload failure
+```bash
+# 一次性环境准备（见 wol-rs/README.md）
+# 每个新 shell 需要激活：
+. ~/export-esp.sh
+. "$HOME/.cargo/env"
 
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
+cd wol-rs
+cargo build
+cargo espflash flash --monitor --partition-table ../partitions.csv
+```
 
-## Technical support and feedback
+## HTTP API
 
-Please use the following feedback channels:
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/` | 内嵌单页 Web UI |
+| GET | `/api/status` | 状态 JSON（`id`/`ip`/`ssid`/`rssi`/`heap`/`broadcast`/`mac_count`/`temp_c`/`time`…） |
+| GET / POST | `/api/config` | 读取 / 保存运行配置（NVS） |
+| GET | `/api/wake` | 发送魔术包，`?mac=<MAC>` 必传，`?ip=<IP>` 可选 |
+| GET | `/api/mac` | MAC/IP 地址簿 |
 
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
+## MQTT 协议
 
-We will get back to you as soon as possible.
+设备 ID = Wi-Fi STA MAC 的 12 位大写十六进制。订阅主题（固定为编译期常量 + `/<id>`）：
+
+- `wakemanager/broadcast`（共享）：设备发现，`{"cmd":"status"}` → 状态应答
+- `wakemanager/cmd/<id>`：`{"cmd":"wake","mac":"AA:BB:CC:DD:EE:FF","ip":"..."}`（`mac` 必传）
+- `wakemanager/mac/<id>`：地址簿 `set/add/update`、`del/delete/remove`、`clear`
+- `wakemanager/mac/get/<id>`：查询地址簿
+
+发布主题：`wakemanager/status`。
+
+> 详细说明、命令示例与开发注意事项见 [`CLAUDE.md`](CLAUDE.md)。

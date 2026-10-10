@@ -8,50 +8,43 @@
 //! 发布：
 //!   - status：命令结果、发现应答、地址簿列表
 //!
-//! 生命周期用 esp-idf-svc 的 `EspMqttClient`（回调驱动）；
-//! 回调内的 publish/subscribe 用裸 FFI（与 C 版在事件回调里
-//! 调 `esp_mqtt_client_publish(client,...)` 的模式一致，client 指针
-//! 存于 RAW 静态变量）。
+//! 生命周期用 esp-idf-svc 的 `EspMqttClient`：`EspMqttClient::new` 返回
+//! `(client, connection)`，由一个专属线程持有 `connection` 并用阻塞的
+//! `connection.next()` 驱动事件循环；发布/订阅通过全局 `CLIENT`（`Mutex`）
+//! 调用 `client.publish/subscribe`。相比原回调 + 裸 FFI publish 的写法，
+//! 不再需要 `AtomicPtr` 与手工 CString。
 
-use std::ffi::{c_char, CString};
 use std::net::ToSocketAddrs;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::thread::JoinHandle;
 
-use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::mqtt::client::{
-    Details, EspMqttClient, EspMqttEvent, EventPayload, MqttClientConfiguration,
-};
-use esp_idf_svc::sys::{
-    esp_mqtt_client, esp_mqtt_client_publish, esp_mqtt_client_subscribe_single,
+    Details, EspMqttClient, EspMqttConnection, EspMqttEvent, EventPayload,
+    MqttClientConfiguration, QoS,
 };
 
 use crate::app_config as ac;
-use crate::chip_temp;
 use crate::config_store;
 use crate::device_info;
 use crate::led_status;
 use crate::mac_store;
-use crate::netinfo;
-use crate::time_sync;
+use crate::status;
 use crate::wol;
 
-/// 回调内 FFI publish/subscribe 用的裸 client 句柄（new_cb 返回后写入；
-/// 首个 CONNECTED 事件到达时必然已写入——TCP 握手远慢于 store）
-static RAW: AtomicPtr<esp_mqtt_client> = AtomicPtr::new(std::ptr::null_mut());
 static CONNECTED: AtomicBool = AtomicBool::new(false);
+
+/// 客户端句柄（事件线程与 HTTP 线程通过它发布/订阅）。
 static CLIENT: Mutex<Option<EspMqttClient<'static>>> = Mutex::new(None);
+/// 事件循环线程，`stop()` 时 join。
+static EVENT_THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
 /// 已解析的四个订阅主题（fixed base + "/" + device id）
 struct Topics {
-    bcast: CString,
-    wake: CString,
-    mac: CString,
-    mac_get: CString,
-    bcast_str: String,
-    wake_str: String,
-    mac_str: String,
-    mac_get_str: String,
+    bcast: String,
+    wake: String,
+    mac: String,
+    mac_get: String,
 }
 
 static TOPICS: OnceLock<Topics> = OnceLock::new();
@@ -59,78 +52,40 @@ static TOPICS: OnceLock<Topics> = OnceLock::new();
 /// 跨 MQTT_EVENT_DATA 分片的消息累积器（对应 C 版 s_cmd[256]）
 static ACC: Mutex<(Vec<u8>, usize)> = Mutex::new((Vec::new(), 0));
 
-fn check() -> Option<*mut esp_mqtt_client> {
-    let raw = RAW.load(Ordering::SeqCst);
-    (!raw.is_null()).then_some(raw)
-}
-
 /// 对应 C 版 publish_status()：发布原始字符串到 status 主题（QoS 1）
 fn publish_status(msg: &str) {
-    let Some(raw) = check() else { return };
     // MQTT 发送活动指示
     led_status::activity();
-    let id = unsafe {
-        esp_mqtt_client_publish(
-            raw,
-            c"wakemanager/status".as_ptr(),
-            msg.as_ptr() as *const c_char,
-            msg.len() as i32,
-            1,
-            0,
-        )
-    };
-    ::log::info!(
-        "Publishing to \"{}\": \"{}\" (msg_id={})",
+
+    let mut guard = CLIENT.lock().unwrap();
+    let Some(client) = guard.as_mut() else { return };
+    match client.publish(
         ac::WOL_MQTT_STATUS_TOPIC,
-        msg,
-        id
-    );
+        QoS::AtLeastOnce,
+        false,
+        msg.as_bytes(),
+    ) {
+        Ok(id) => ::log::info!(
+            "Publishing to \"{}\": \"{}\" (msg_id={})",
+            ac::WOL_MQTT_STATUS_TOPIC,
+            msg,
+            id
+        ),
+        Err(e) => ::log::error!(
+            "Failed to publish to \"{}\": {e:?}",
+            ac::WOL_MQTT_STATUS_TOPIC
+        ),
+    }
 }
 
-/// 本设备状态快照（对应 C 版 publish_device_status，cJSON → serde_json）
+/// 本设备状态快照（对应 C 版 publish_device_status；JSON 由 `status` 模块构造）
 fn publish_device_status() {
-    let mut m = serde_json::Map::new();
-    m.insert("id".into(), device_info::get_id().into());
-    m.insert("ip".into(), netinfo::sta_ip().into());
-    match netinfo::sta_ssid_rssi() {
-        Some((ssid, rssi)) => {
-            m.insert("ssid".into(), ssid.into());
-            m.insert("rssi".into(), (rssi as i64).into());
-        }
-        None => {
-            m.insert("ssid".into(), "".into());
-            m.insert("rssi".into(), 0.into());
-        }
-    }
-    m.insert("heap".into(), (netinfo::free_heap() as u64).into());
-    m.insert("broadcast".into(), wol::get_default_broadcast().into());
-    m.insert("mqtt_connected".into(), CONNECTED.load(Ordering::SeqCst).into());
-    m.insert("mac_count".into(), (mac_store::count() as u64).into());
-    if let Ok(c) = chip_temp::read() {
-        m.insert("temp_c".into(), (c as f64).into());
-    }
-    if time_sync::is_synced() {
-        m.insert("time".into(), time_sync::format_now().into());
-    }
-    publish_status(&serde_json::Value::Object(m).to_string());
+    publish_status(&status::device_status_json());
 }
 
 /// 地址簿列表（对应 C 版 publish_mac_list）
 fn publish_mac_list() {
-    let table = mac_store::get();
-    let mut m = serde_json::Map::new();
-    m.insert("id".into(), device_info::get_id().into());
-    m.insert("cmd".into(), "mac_list".into());
-    m.insert("count".into(), (table.entries.len() as u64).into());
-    let arr: Vec<serde_json::Value> = table
-        .entries
-        .iter()
-        .map(|e| {
-            serde_json::json!({ "mac": e.mac, "ip": e.ip })
-        })
-        .collect();
-    m.insert("macs".into(), arr.into());
-    publish_status(&serde_json::Value::Object(m).to_string());
+    publish_status(&status::mac_list_mqtt_json());
 }
 
 /// JSON 命令对象（对应 C 版 parse_command：非字符串字段按缺省处理）
@@ -296,42 +251,33 @@ fn handle_broadcast_command(cmd: &str) {
     }
 }
 
-/// 事件回调：连接/断开/数据分片累积/命令分发（对应 mqtt_event_handler）
-fn handle_event(event: EspMqttEvent<'_>) {
+/// 事件回调（在事件线程中调用，对应 C 版 mqtt_event_handler）
+fn handle_event(event: &EspMqttEvent<'_>) {
     match event.payload() {
         EventPayload::Connected(_) => {
             CONNECTED.store(true, Ordering::SeqCst);
 
-            // new_cb 内部已 start；首个 CONNECTED 到达时 RAW 通常已写入，
-            // 兜底等待极短时间再订阅
-            for _ in 0..100 {
-                if check().is_some() {
-                    break;
+            // 订阅四个主题（client 在 start() 中已写入，此处必然可用）
+            {
+                let Some(topics) = TOPICS.get() else { return };
+                let mut guard = CLIENT.lock().unwrap();
+                if let Some(client) = guard.as_mut() {
+                    for (label, t) in [
+                        ("broadcast", &topics.bcast),
+                        ("wake", &topics.wake),
+                        ("mac", &topics.mac),
+                        ("mac get", &topics.mac_get),
+                    ] {
+                        match client.subscribe(t, QoS::AtLeastOnce) {
+                            Ok(id) => {
+                                ::log::info!("Subscribed to {label} topic {t} (msg_id={id})")
+                            }
+                            Err(e) => ::log::error!("Failed to subscribe to {label} topic {t}: {e:?}"),
+                        }
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            let Some(raw) = check() else {
-                ::log::error!("MQTT client handle unavailable, cannot subscribe");
-                return;
-            };
-            let Some(topics) = TOPICS.get() else { return };
-            for (label, t) in [
-                ("broadcast", &topics.bcast),
-                ("wake", &topics.wake),
-                ("mac", &topics.mac),
-                ("mac get", &topics.mac_get),
-            ] {
-                if t.to_bytes().is_empty() {
-                    continue;
-                }
-                let id = unsafe { esp_mqtt_client_subscribe_single(raw, t.as_ptr(), 1) };
-                ::log::info!(
-                    "Subscribed to {} topic {} (msg_id={})",
-                    label,
-                    t.to_string_lossy(),
-                    id
-                );
-            }
+
             publish_status("online");
         }
 
@@ -358,10 +304,10 @@ fn handle_event(event: EspMqttEvent<'_>) {
             );
 
             let Some(topics) = TOPICS.get() else { return };
-            let is_wake = topic == topics.wake_str;
-            let is_bcast = topic == topics.bcast_str;
-            let is_mac = topic == topics.mac_str;
-            let is_mac_get = topic == topics.mac_get_str;
+            let is_wake = topic == topics.wake.as_str();
+            let is_bcast = topic == topics.bcast.as_str();
+            let is_mac = topic == topics.mac.as_str();
+            let is_mac_get = topic == topics.mac_get.as_str();
             if !is_wake && !is_bcast && !is_mac && !is_mac_get {
                 return;
             }
@@ -415,6 +361,15 @@ fn handle_event(event: EspMqttEvent<'_>) {
     }
 }
 
+/// 事件循环线程主体：阻塞等待事件直到通道关闭（client 被 drop）。
+fn mqtt_event_loop(mut connection: EspMqttConnection) {
+    while let Ok(event) = connection.next() {
+        handle_event(event);
+    }
+    CONNECTED.store(false, Ordering::SeqCst);
+    ::log::info!("MQTT event loop terminated");
+}
+
 /// 对应 C 版 dns_debug_task()：一次性 DNS 诊断日志
 fn dns_debug(uri: String) {
     let after = uri.split("://").nth(1).unwrap_or(uri.as_str());
@@ -437,9 +392,11 @@ fn dns_debug(uri: String) {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // 字段随 Debug 输出使用
 pub enum MqttStartError {
     NoUri,
     Init(esp_idf_svc::sys::EspError),
+    Thread(std::io::Error),
 }
 
 /// 对应 C 版 `control_mqtt_start()`
@@ -457,23 +414,11 @@ pub fn start() -> Result<(), MqttStartError> {
 
     // 解析固定主题；每设备主题追加 "/<device id>"
     let dev_id = device_info::get_id();
-    let mk = |base: &str| -> (CString, String) {
-        let s = format!("{base}/{dev_id}");
-        (CString::new(s.clone()).expect("no NUL"), s)
-    };
-    let (wake, wake_str) = mk(ac::WOL_MQTT_CMD_TOPIC);
-    let (mac, mac_str) = mk(ac::WOL_MQTT_MAC_TOPIC);
-    let (mac_get, mac_get_str) = mk(ac::WOL_MQTT_MAC_GET_TOPIC);
-    let bcast_str = ac::WOL_MQTT_BROADCAST_TOPIC.to_string();
     let _ = TOPICS.set(Topics {
-        bcast: CString::new(bcast_str.clone()).expect("no NUL"),
-        wake,
-        mac,
-        mac_get,
-        bcast_str,
-        wake_str,
-        mac_str,
-        mac_get_str,
+        bcast: ac::WOL_MQTT_BROADCAST_TOPIC.to_string(),
+        wake: format!("{}/{}", ac::WOL_MQTT_CMD_TOPIC, dev_id),
+        mac: format!("{}/{}", ac::WOL_MQTT_MAC_TOPIC, dev_id),
+        mac_get: format!("{}/{}", ac::WOL_MQTT_MAC_GET_TOPIC, dev_id),
     });
 
     // 诊断：日志打印 broker 域名解析结果
@@ -493,39 +438,45 @@ pub fn start() -> Result<(), MqttStartError> {
         ..Default::default()
     };
 
-    let client = EspMqttClient::new_cb(&cfg.mqtt_uri, &conf, handle_event)
-        .map_err(MqttStartError::Init)?;
-
-    // 回调内的 FFI 发布用裸句柄（在 start 期间写入，早于任何 CONNECTED）
-    RAW.store(client.handle(), Ordering::SeqCst);
-
-    let topics = TOPICS.get().expect("topics just set");
-    ::log::info!(
-        "MQTT client starting, broker: {}, id: {}",
-        cfg.mqtt_uri,
-        dev_id
-    );
-    ::log::info!(
-        "Topics: broadcast={} wake={} mac={} mac_get={} status={}",
-        topics.bcast_str,
-        topics.wake_str,
-        topics.mac_str,
-        topics.mac_get_str,
-        ac::WOL_MQTT_STATUS_TOPIC
-    );
+    let (client, connection) =
+        EspMqttClient::new(&cfg.mqtt_uri, &conf).map_err(MqttStartError::Init)?;
 
     *CLIENT.lock().unwrap() = Some(client);
+
+    let handle = std::thread::Builder::new()
+        .name("mqtt_events".into())
+        .stack_size(4096)
+        .spawn(move || mqtt_event_loop(connection))
+        .map_err(MqttStartError::Thread)?;
+    *EVENT_THREAD.lock().unwrap() = Some(handle);
+
+    ::log::info!("MQTT client starting, broker: {}, id: {}", cfg.mqtt_uri, dev_id);
+    if let Some(t) = TOPICS.get() {
+        ::log::info!(
+            "Topics: broadcast={} wake={} mac={} mac_get={} status={}",
+            t.bcast,
+            t.wake,
+            t.mac,
+            t.mac_get,
+            ac::WOL_MQTT_STATUS_TOPIC
+        );
+    }
     Ok(())
 }
 
 /// 对应 C 版 `control_mqtt_stop()`
 pub fn stop() {
     CONNECTED.store(false, Ordering::SeqCst);
-    // take → drop → EspMqttClient::drop 内部调用 esp_mqtt_client_destroy
-    if CLIENT.lock().unwrap().take().is_some() {
-        ::log::info!("MQTT client stopped");
+
+    // 取出 client 后立即释放锁，再 drop：drop 会销毁底层 client 并关闭事件
+    // 通道，事件线程随之退出，然后 join。
+    let client = CLIENT.lock().unwrap().take();
+    drop(client);
+
+    if let Some(handle) = EVENT_THREAD.lock().unwrap().take() {
+        let _ = handle.join();
     }
-    RAW.store(std::ptr::null_mut(), Ordering::SeqCst);
+    ::log::info!("MQTT client stopped");
 }
 
 /// 对应 C 版 `control_mqtt_restart()`

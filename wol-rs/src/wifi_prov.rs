@@ -6,50 +6,59 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Condvar, Mutex};
 
 use esp_idf_sys::*;
 
 use crate::app_config as ac;
 use crate::led_status;
 
-/// IP_EVENT_STA_GOT_IP 置位；`wait_connected()` 轮询等待
-static GOT_IP: AtomicBool = AtomicBool::new(false);
+/// IP_EVENT_STA_GOT_IP 置位；`wait_connected()` 在条件变量上等待（无轮询）
+static CONNECTED: Mutex<bool> = Mutex::new(false);
+static CONNECTED_CV: Condvar = Condvar::new();
+
+fn signal_connected() {
+    *CONNECTED.lock().unwrap() = true;
+    CONNECTED_CV.notify_all();
+}
 
 /// 复刻 C 宏 `WIFI_INIT_CONFIG_DEFAULT()`（bindgen 不可见：宏内含大量
-/// CONFIG_ 派生宏）。数值取自本次构建生成的 sdkconfig，与 C 版固件一致。
+/// CONFIG_ 派生宏）。
+///
+/// 数值全部取自 esp-idf-sys 由当前 sdkconfig 生成的 `WIFI_*` / `CONFIG_*`
+/// 常量（与 esp-idf-svc 内部实现一致），因此改 menuconfig 后会自动跟随，
+/// 不再需要手工同步硬编码值。
 fn wifi_init_config_default() -> wifi_init_config_t {
     // SAFETY: g_wifi_osi_funcs 由 esp_wifi 组件提供；wpa crypto 表为只读默认值
     unsafe {
         wifi_init_config_t {
             osi_funcs: &raw mut g_wifi_osi_funcs,
             wpa_crypto_funcs: ptr::read(&raw const g_wifi_default_wpa_crypto_funcs),
-            static_rx_buf_num: 10,      // CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM
-            dynamic_rx_buf_num: 32,     // CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM
-            tx_buf_type: 1,             // CONFIG_ESP_WIFI_TX_BUFFER_TYPE (=DATA)
-            static_tx_buf_num: 0,
-            dynamic_tx_buf_num: 32,     // CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM
-            rx_mgmt_buf_type: 0,
-            rx_mgmt_buf_num: 5,         // CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF
-            cache_tx_buf_num: 0,
-            csi_enable: 0,
-            ampdu_rx_enable: 1,
-            ampdu_tx_enable: 1,
-            amsdu_tx_enable: 0,
+            static_rx_buf_num: CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM as _,
+            dynamic_rx_buf_num: CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM as _,
+            tx_buf_type: CONFIG_ESP_WIFI_TX_BUFFER_TYPE as _,
+            static_tx_buf_num: WIFI_STATIC_TX_BUFFER_NUM as _,
+            dynamic_tx_buf_num: WIFI_DYNAMIC_TX_BUFFER_NUM as _,
+            rx_mgmt_buf_type: CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUF as _,
+            rx_mgmt_buf_num: WIFI_RX_MGMT_BUF_NUM_DEF as _,
+            cache_tx_buf_num: WIFI_CACHE_TX_BUFFER_NUM as _,
+            csi_enable: WIFI_CSI_ENABLED as _,
+            ampdu_rx_enable: WIFI_AMPDU_RX_ENABLED as _,
+            ampdu_tx_enable: WIFI_AMPDU_TX_ENABLED as _,
+            amsdu_tx_enable: WIFI_AMSDU_TX_ENABLED as _,
             nvs_enable: 1,
-            nano_enable: 0,
-            rx_ba_win: 6,               // CONFIG_ESP_WIFI_RX_BA_WIN
-            wifi_task_core_id: 0,
-            beacon_max_len: 752,        // CONFIG_ESP_WIFI_SOFTAP_BEACON_MAX_LEN
-            mgmt_sbuf_num: 32,          // CONFIG_ESP_WIFI_MGMT_SBUF_NUM
-            feature_caps: 1,            // CONFIG_FEATURE_WPA3_SAE_BIT（WPA3_SAE=y）
-            sta_disconnected_pm: true,
-            espnow_max_encrypt_num: 7,
-            tx_hetb_queue_num: 1,
-            dump_hesigb_enable: false,
-            privacy_enhancements: false,
-            rmac_auto_reset_int: 0,
+            nano_enable: WIFI_NANO_FORMAT_ENABLED as _,
+            rx_ba_win: WIFI_DEFAULT_RX_BA_WIN as _,
+            wifi_task_core_id: WIFI_TASK_CORE_ID as _,
+            beacon_max_len: WIFI_SOFTAP_BEACON_MAX_LEN as _,
+            mgmt_sbuf_num: WIFI_MGMT_SBUF_NUM as _,
+            feature_caps: WIFI_FEATURE_CAPS as _,
+            sta_disconnected_pm: WIFI_STA_DISCONNECTED_PM_ENABLED != 0,
+            espnow_max_encrypt_num: CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM as _,
+            tx_hetb_queue_num: WIFI_TX_HETB_QUEUE_NUM as _,
+            dump_hesigb_enable: WIFI_DUMP_HESIGB_ENABLED != 0,
+            privacy_enhancements: WIFI_PRIVACY_ENHANCEMENTS_ENABLED != 0,
+            rmac_auto_reset_int: WIFI_RMAC_AUTO_RESET_INTERVAL as _,
             magic: WIFI_INIT_CONFIG_MAGIC as _, // 必须正确
         }
     }
@@ -60,6 +69,7 @@ fn wifi_init_config_default() -> wifi_init_config_t {
 ///
 /// # Safety
 /// 由 esp_event 循环以裸指针回调；只读取 event_data 中需要的字段。
+#[allow(non_upper_case_globals)] // 匹配 bindgen 生成的常量名
 unsafe extern "C" fn event_handler(
     _arg: *mut c_void,
     event_base: esp_event_base_t,
@@ -129,7 +139,7 @@ unsafe extern "C" fn event_handler(
             (ip.addr as u32 >> 24) & 0xff
         );
         led_status::set(led_status::Status::Connected);
-        GOT_IP.store(true, Ordering::SeqCst);
+        signal_connected();
     } else if event_base == PROTOCOMM_TRANSPORT_BLE_EVENT {
         match event_id as u32 {
             protocomm_transport_ble_event_t_PROTOCOMM_TRANSPORT_BLE_CONNECTED => {
@@ -187,17 +197,25 @@ fn check(err: esp_err_t, ctx: &str) {
     }
 }
 
-/// BLE 名称 / 服务名：`PROV_` + STA MAC 后 3 字节（与 C 版一致）
-fn device_service_name() -> std::ffi::CString {
-    let mac = crate::device_info::get_mac();
-    std::ffi::CString::new(format!(
-        "{}{:02X}{:02X}{:02X}",
-        ac::PROV_DEVICE_NAME_PREFIX,
-        mac[3],
-        mac[4],
-        mac[5]
-    ))
-    .expect("service name has no NUL")
+/// BLE 名称 / 服务名：`PROV_` + STA MAC 后 3 字节（与 C 版一致）。
+/// `esp_wifi_get_mac` 失败时返回 `None`（调用方回退到全零后缀并记录）。
+fn device_service_name() -> Option<std::ffi::CString> {
+    match crate::device_info::get_mac() {
+        Ok(mac) => Some(
+            std::ffi::CString::new(format!(
+                "{}{:02X}{:02X}{:02X}",
+                ac::PROV_DEVICE_NAME_PREFIX,
+                mac[3],
+                mac[4],
+                mac[5]
+            ))
+            .expect("service name has no NUL"),
+        ),
+        Err(e) => {
+            ::log::error!("Cannot read STA MAC for provisioning service name: {e:?}");
+            None
+        }
+    }
 }
 
 /// 对应 C 版 prov_print_qr()：打印配网 payload（日志用）
@@ -291,7 +309,10 @@ pub fn start() {
         if !provisioned {
             ::log::info!("Device is not provisioned, starting BLE provisioning");
 
-            let service_name = device_service_name();
+            let service_name = device_service_name().unwrap_or_else(|| {
+                std::ffi::CString::new(format!("{}000000", ac::PROV_DEVICE_NAME_PREFIX))
+                    .expect("service name has no NUL")
+            });
 
             // 可选自定义端点：先 create（start 之前），start 之后再 register
             let ep_name = c"custom-data";
@@ -349,7 +370,8 @@ pub fn start() {
 /// 对应 C 版 `wifi_prov_wait_connected()`：阻塞直到拿到 IP
 pub fn wait_connected() {
     ::log::info!("Waiting for IP address...");
-    while !GOT_IP.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(100));
+    let mut connected = CONNECTED.lock().unwrap();
+    while !*connected {
+        connected = CONNECTED_CV.wait(connected).unwrap();
     }
 }

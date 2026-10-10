@@ -57,7 +57,8 @@ pub fn init() -> Result<(), esp_err_t> {
     Ok(())
 }
 
-/// 对应 C 版 `chip_temp_is_ready()`
+/// 对应 C 版 `chip_temp_is_ready()`（保留 API，当前未调用）
+#[allow(dead_code)]
 pub fn is_ready() -> bool {
     SENSOR.lock().unwrap().is_some()
 }
