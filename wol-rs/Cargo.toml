@@ -1,0 +1,45 @@
+[package]
+name = "wol-rs"
+version = "0.1.0"
+authors = ["hyy <240011814@qq.com>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.82"
+
+[[bin]]
+name = "wol-rs"
+harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true    # Symbols are nice, and they don't increase the size on Flash
+opt-level = "z"
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = { version = "0.53", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
+esp-idf-sys = "0.38"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
+embassy-time = { version = "0.5", features = ["generic-queue-8"] }
+
+[build-dependencies]
+embuild = "0.33.5"
+
+# ---------------------------------------------------------------------------
+# esp-idf-sys 构建配置（根 crate 的 metadata，由 build.rs / embuild 消费）
+# ---------------------------------------------------------------------------
+# IDF v6.0 起 mqtt 移出主仓库，变为外部托管组件；network_provisioning 本来
+# 就是托管组件。两者都需参与构建。
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/mqtt", version = "1.*" }
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/network_provisioning", version = "1.*" }
+# network_provisioning 不在 esp-idf-sys 默认 bindings.h 中 → 用自己的头文件
+# 生成绑定。不设 bindings_module：绑定并入 esp_idf_sys 根，与主 IDF 绑定共
+# 享同一套类型（wifi_mode_t / esp_err_t 等不会出现两套定义）。
+bindings_header = "bindings.h"
