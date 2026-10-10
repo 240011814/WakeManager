@@ -271,5 +271,6 @@ WakeManager/
 - **看门狗**：`watchdog_init()` 会 `reconfigure`（IDF 默认已 `CONFIG_ESP_TASK_WDT_INIT` 自动初始化），监控各核 idle 任务，`WATCHDOG_TRIGGER_PANIC=1` 时超时复位。若任务可能长时间阻塞（如等待配网），**不要**提前把它加入看门狗，应在开始循环喂狗后再 `watchdog_add_current_task()`。
 - **SNTP**：`esp_sntp.h` 由 `lwip` 组件提供，需 `CONFIG_LWIP_SNTP_*`（默认开启）；时区用 `setenv("TZ", ...)` + `tzset()` 设置。
 - **广播地址 / 目标 MAC**：无静态配置；`mac` 必传，目标地址按 运行时 `ip` → 地址簿 IP → 自动推导广播 解析。
+- **日志时间戳**：`CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y`（见 `sdkconfig.defaults`），串口日志时间显示为 `HH:MM:SS.sss`（本地时间，时区由 `TIME_TIMEZONE` 决定），不再是默认的开机毫秒数。时钟由 Wi-Fi 连接后的 SNTP 校时（`time_sync`）设置：**校时前（含配网模式）日志时间戳为 `00:00:00.xxx`（Unix epoch，代表未校时）**；第二阶段 bootloader 的日志仍显示 CPU tick 时间。
 - **本机构建**：`idf.py` 不在 PATH，需用 `python "$IDF_PATH/tools/idf.py"` 调用。
 ```

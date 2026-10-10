@@ -13,3 +13,8 @@ CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# --- Logging: show the system (local) wall-clock time instead of the
+#     default "milliseconds since boot" (I (12345)). The clock is set by the
+#     SNTP sync after Wi-Fi connects; before that it reads 00:00:00 (epoch). ---
+CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y
