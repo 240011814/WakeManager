@@ -6,7 +6,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::sys::EspError;
 
 use crate::app_config as ac;
@@ -47,6 +47,20 @@ impl From<EspError> for MacError {
 
 static PARTITION: OnceLock<EspDefaultNvsPartition> = OnceLock::new();
 static TABLE: OnceLock<Mutex<MacTable>> = OnceLock::new();
+/// 可写 NVS 句柄缓存：首次写盘时打开一次，之后所有写操作复用
+static NVS_RW: OnceLock<Mutex<EspNvs<NvsDefault>>> = OnceLock::new();
+
+/// 打开（或复用）可写句柄。打开失败不缓存，下次写盘时重试。
+fn writable_nvs(
+    part: &EspDefaultNvsPartition,
+) -> Result<&'static Mutex<EspNvs<NvsDefault>>, EspError> {
+    if let Some(nvs) = NVS_RW.get() {
+        return Ok(nvs);
+    }
+    let nvs = EspNvs::new(part.clone(), NVS_NAMESPACE, true)?;
+    let _ = NVS_RW.set(Mutex::new(nvs));
+    Ok(NVS_RW.get().expect("writable NVS handle just set"))
+}
 
 /// 对应 C 版 `mac_store_init()`
 pub fn init(partition: EspDefaultNvsPartition) -> Result<(), EspError> {
@@ -105,9 +119,9 @@ fn decode(buf: &[u8]) -> MacTable {
 
 fn persist(table: &MacTable) -> Result<(), EspError> {
     let part = PARTITION.get().expect("mac_store::init not called");
-    let nvs = EspNvs::new(part.clone(), NVS_NAMESPACE, true)?;
+    let nvs = writable_nvs(part)?;
     let blob = encode(table);
-    nvs.set_blob(NVS_KEY, &blob)?;
+    nvs.lock().unwrap().set_blob(NVS_KEY, &blob)?;
     Ok(())
 }
 

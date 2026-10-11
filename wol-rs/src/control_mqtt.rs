@@ -52,6 +52,9 @@ static TOPICS: OnceLock<Topics> = OnceLock::new();
 /// 跨 MQTT_EVENT_DATA 分片的消息累积器（对应 C 版 s_cmd[256]）
 static ACC: Mutex<(Vec<u8>, usize)> = Mutex::new((Vec::new(), 0));
 
+/// 命令缓冲上限（对应 C 版 s_cmd[256]：255 字节 + NUL）
+const MAX_CMD_LEN: usize = 255;
+
 /// 对应 C 版 publish_status()：发布原始字符串到 status 主题（QoS 1）
 fn publish_status(msg: &str) {
     // MQTT 发送活动指示
@@ -141,38 +144,25 @@ fn handle_wake_command(cmd: &str) {
         return;
     }
 
-    // 命令没带 IP → 查地址簿；再没有则用自动推导的广播地址
-    let mut stored_ip = String::new();
-    let target_ip: &str = if !c.ip.is_empty() {
-        c.ip.as_str()
-    } else if mac_store::get_ip(&c.mac)
-        .map(|ip| {
-            if !ip.is_empty() {
-                stored_ip = ip;
-                true
-            } else {
-                false
-            }
-        })
-        .unwrap_or(false)
-    {
-        ::log::info!("Using stored IP {} for {}", stored_ip, c.mac);
-        stored_ip.as_str()
+    // 命令没带 IP → 查地址簿（只取非空记录）；再没有则 None，
+    // 由 wol::send_to 退回自动推导的子网定向广播地址
+    let target_ip = if !c.ip.is_empty() {
+        Some(c.ip.clone())
     } else {
-        ""
+        let stored = mac_store::get_ip(&c.mac).filter(|ip| !ip.is_empty());
+        if let Some(ip) = &stored {
+            ::log::info!("Using stored IP {} for {}", ip, c.mac);
+        }
+        stored
     };
 
     ::log::info!(
         "Wake request: mac={} ip={}",
         c.mac,
-        if target_ip.is_empty() {
-            "(default)"
-        } else {
-            target_ip
-        }
+        target_ip.as_deref().unwrap_or("(default)")
     );
 
-    match wol::send_str_to(&c.mac, Some(target_ip)) {
+    match wol::send_str_to(&c.mac, target_ip.as_deref()) {
         Ok(()) => publish_status("ok: magic packet sent"),
         Err(wol::WolError::InvalidArg) => publish_status("error: invalid MAC or IP in command"),
         Err(_) => publish_status("error: failed to send magic packet"),
@@ -313,7 +303,7 @@ fn handle_event(event: &EspMqttEvent<'_>) {
             }
 
             // 分片累积（对应 C 版 s_cmd[256]：offset 0 重置、255 字节上限、
-            // 收满 total 后分发）
+            // 收满 total 后分发；超限消息整体丢弃并清空残留）
             let text = {
                 let mut g = ACC.lock().unwrap();
                 match details {
@@ -322,19 +312,38 @@ fn handle_event(event: &EspMqttEvent<'_>) {
                         g.1 = d.total_data_size;
                     }
                     Details::SubsequentChunk(d) => g.1 = d.total_data_size,
-                    Details::Complete => g.1 = g.0.len() + data.len(),
+                    Details::Complete => {
+                        // 完整消息单事件到达：先清残留，防止与上一条未分发
+                        // 的数据拼接
+                        g.0.clear();
+                        g.1 = data.len();
+                    }
                 }
-                let space = 255usize.saturating_sub(g.0.len());
-                let copy = data.len().min(space);
-                g.0.extend_from_slice(&data[..copy]);
 
-                if g.0.len() >= g.1 {
-                    let text = String::from_utf8_lossy(&g.0).into_owned();
+                if g.1 > MAX_CMD_LEN {
+                    // 超限：丢弃整条消息。同一消息的后续分片没有 InitialChunk，
+                    // 但 SubsequentChunk 会再次带来超限的 total，同样在此丢弃。
+                    ::log::warn!(
+                        "MQTT message of {} bytes exceeds {}-byte command limit, dropped",
+                        g.1,
+                        MAX_CMD_LEN
+                    );
                     g.0.clear();
                     g.1 = 0;
-                    Some(text)
-                } else {
                     None
+                } else {
+                    let space = MAX_CMD_LEN.saturating_sub(g.0.len());
+                    let copy = data.len().min(space);
+                    g.0.extend_from_slice(&data[..copy]);
+
+                    if g.0.len() >= g.1 {
+                        let text = String::from_utf8_lossy(&g.0).into_owned();
+                        g.0.clear();
+                        g.1 = 0;
+                        Some(text)
+                    } else {
+                        None
+                    }
                 }
             };
 

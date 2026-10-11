@@ -134,11 +134,11 @@ fn main() {
 
     ::log::info!(
         "Free heap after Wi-Fi connected: {} bytes",
-        unsafe { esp_get_free_heap_size() }
+        netinfo::free_heap()
     );
 
-    // ---- 网络就绪：SNTP 校时（非阻塞）----
-    time_sync::start();
+    // ---- 网络就绪：SNTP 校时（非阻塞；句柄全程保活，Drop 会停掉 SNTP）----
+    let _sntp = time_sync::start();
 
     // ---- 从现在起主任务必须持续喂狗 ----
     if watchdog::add_current_task().is_err() {

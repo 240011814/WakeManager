@@ -23,12 +23,12 @@ opt-level = "z"
 
 [dependencies]
 log = "0.4"
-esp-idf-svc = { version = "0.53", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
+# critical-section：模板要求的 cs 后端。embassy-* features 已随未使用的
+# embassy-time 依赖一并移除（全项目无 embassy 调用点）。
+esp-idf-svc = { version = "0.53", features = ["critical-section"] }
 esp-idf-sys = "0.38"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
-embassy-time = { version = "0.5", features = ["generic-queue-8"] }
 
 [build-dependencies]
 embuild = "0.33.5"

@@ -143,9 +143,9 @@ WakeManager/
         ├── status.rs           # 状态/配置/地址簿的 serde 视图（JSON 构造）
         ├── wol.rs              # 魔术包（std UdpSocket）+ 子网广播推导
         ├── chip_temp.rs        # 片内温度（temperature_sensor FFI）
-        ├── time_sync.rs        # SNTP（esp_sntp FFI）
+        ├── time_sync.rs        # SNTP（EspSntp 高层封装 + 时区 setenv）
         ├── watchdog.rs         # TWDT（esp_task_wdt FFI）
-        ├── led_status.rs       # GPIO48 + 独立线程
+        ├── led_status.rs       # GPIO48 + 独立线程（PinDriver，Condvar 事件驱动）
         ├── wifi_prov.rs        # BLE 配网（network_provisioning FFI）
         ├── control_http.rs     # EspHttpServer（专属线程持有）+ 内嵌 index.html
         └── control_mqtt.rs     # EspMqttClient + 事件循环线程
@@ -182,7 +182,7 @@ WakeManager/
 
 ## 时间同步（time_sync）
 
-`time_sync.rs`：Wi-Fi 拿到 IP 后调用 `time_sync::start()`，通过 SNTP 校时；服务器与 POSIX 时区分别由 `NTP_SERVER`、`TIME_TIMEZONE`（默认 `pool.ntp.org` / `CST-8`）固定。`is_synced()` 判断是否已同步，`format_now()` 输出本地时间字符串。
+`time_sync.rs`：Wi-Fi 拿到 IP 后调用 `time_sync::start()`，通过 SNTP 校时（esp-idf-svc 的 `EspSntp` 封装，句柄由 `main()` 保活）；服务器与 POSIX 时区分别由 `NTP_SERVER`、`TIME_TIMEZONE`（默认 `pool.ntp.org` / `CST-8`）固定。`is_synced()` 判断是否已同步，`format_now()` 输出本地时间字符串。
 
 ## 看门狗（watchdog）
 

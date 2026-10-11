@@ -7,7 +7,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::sys::EspError;
 
 use crate::app_config as ac;
@@ -89,6 +89,21 @@ fn read_str(src: &[u8], cap: usize) -> String {
 
 static PARTITION: OnceLock<EspDefaultNvsPartition> = OnceLock::new();
 static CFG: OnceLock<Mutex<WmConfig>> = OnceLock::new();
+/// 可写 NVS 句柄缓存：首次保存时打开一次，之后所有写操作复用
+/// （`EspNvs: Send`，句柄可跨线程共享）。
+static NVS_RW: OnceLock<Mutex<EspNvs<NvsDefault>>> = OnceLock::new();
+
+/// 打开（或复用）可写句柄。打开失败不缓存，下次保存时重试。
+fn writable_nvs(
+    part: &EspDefaultNvsPartition,
+) -> Result<&'static Mutex<EspNvs<NvsDefault>>, EspError> {
+    if let Some(nvs) = NVS_RW.get() {
+        return Ok(nvs);
+    }
+    let nvs = EspNvs::new(part.clone(), NVS_NAMESPACE, true)?;
+    let _ = NVS_RW.set(Mutex::new(nvs));
+    Ok(NVS_RW.get().expect("writable NVS handle just set"))
+}
 
 /// 对应 C 版 `config_store_init()`：加载 NVS blob，失败则用编译期默认值
 pub fn init(partition: EspDefaultNvsPartition) -> Result<(), EspError> {
@@ -129,10 +144,10 @@ pub fn get() -> WmConfig {
 /// 对应 C 版 `config_store_save()`
 pub fn save(cfg: &WmConfig) -> Result<(), EspError> {
     let part = PARTITION.get().expect("config_store::init not called");
-    let nvs = EspNvs::new(part.clone(), NVS_NAMESPACE, true)?;
+    let nvs = writable_nvs(part)?;
 
     let blob = cfg.encode();
-    nvs.set_blob(NVS_KEY, &blob)?;
+    nvs.lock().unwrap().set_blob(NVS_KEY, &blob)?;
 
     *CFG
         .get()

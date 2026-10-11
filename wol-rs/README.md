@@ -17,9 +17,9 @@ LED/看门狗/SNTP/温度），BLE 配网沿用已验证的 FFI 方案。内嵌 
 | `device_info.c` | `src/device_info.rs` | FFI |
 | `wol.c` | `src/wol.rs` | `std::net::UdpSocket` + netif FFI |
 | `chip_temp.c` | `src/chip_temp.rs` | temperature_sensor FFI |
-| `time_sync.c` | `src/time_sync.rs` | esp_sntp FFI（与 C 调用序列一致） |
+| `time_sync.c` | `src/time_sync.rs` | `EspSntp`（esp-idf-svc 高层封装）+ 时区 setenv |
 | `watchdog.c` | `src/watchdog.rs` | esp_task_wdt FFI |
-| `led_status.c` | `src/led_status.rs` | GPIO FFI + 独立线程 |
+| `led_status.c` | `src/led_status.rs` | `PinDriver`（esp-idf-hal）+ Condvar 事件驱动线程 |
 | `wifi_prov.c` | `src/wifi_prov.rs` | network_provisioning FFI（P3 已验证） |
 | `control_http.c` | `src/control_http.rs` | `EspHttpServer`（专属线程持有；index.html include_str 内嵌） |
 | `control_mqtt.c` | `src/control_mqtt.rs` | `EspMqttClient::new` + 事件循环线程（阻塞 `connection.next()`） |
@@ -133,6 +133,25 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
 - `wifi_prov` 的 `WIFI_INIT_CONFIG_DEFAULT()` 字段改用 esp-idf-sys 常量（修正了原先 `feature_caps` 硬编码为 1 的偏差）；`wait_connected()` 改用 `Condvar`。
 - `device_info::get_mac()` 返回 `Result`；HTTP 表单读取校验长度；`truncate()` 按字节并保证 UTF-8 边界。
 
+## 优化记录（2026-10-11）
+
+第二轮优化：消除可替代的裸 FFI + 精简依赖：
+
+- `led_status` 改用 esp-idf-hal 的 `PinDriver`（`Peripherals::take()` + GPIO48 按值
+  move 进 LED 线程），模块零 unsafe；线程改为 Condvar 事件驱动（`set()`/`activity()`
+  唤醒），常亮期间不再 10Hz 轮询。
+- `time_sync` 改用 esp-idf-svc 的 `EspSntp`（`new_with_callback` + `SntpConf`），
+  移除 `Box::leak` server 字符串 hack；句柄由 `main()` 保活（Drop 会停 SNTP）。
+  仅剩 `setenv("TZ")/tzset` 与 `format_now` 的 `localtime_r` 两处 libc FFI。
+- 删除完全未使用的 `embassy-time` 依赖及 esp-idf-svc 的
+  `embassy-time-driver`/`embassy-sync` features（全项目无 embassy 调用点）。
+- `config_store::save` / `mac_store::persist` 缓存可写 `EspNvs` 句柄
+  （`OnceLock<Mutex<…>>`），不再每次写盘重建句柄。
+- MQTT 分片累积器加固：`Complete` 事件先清残留（防与上条未分发数据拼接）；
+  超过 255 字节的消息整体丢弃并告警（原来静默截断且不清残留）。
+- `handle_wake_command` 的地址簿查询改写为 `Option` 链，移除带副作用的闭包；
+  `main` 复用 `netinfo::free_heap()`；删除未调用的 `chip_temp::is_ready()`。
+
 ## 目录
 
 ```
@@ -153,11 +172,11 @@ wol-rs/
     ├── status.rs           # 状态/配置/地址簿的 serde 视图（JSON）
     ├── wol.rs              # magic packet（std UdpSocket）+ 子网广播推导
     ├── chip_temp.rs        # 片内温度（temperature_sensor FFI）
-    ├── time_sync.rs        # SNTP（esp_sntp FFI）
+    ├── time_sync.rs        # SNTP（EspSntp 高层封装 + 时区 setenv）
     ├── watchdog.rs         # TWDT（esp_task_wdt FFI）
-    ├── led_status.rs       # GPIO48 + 独立线程（FFI + std thread）
+    ├── led_status.rs       # GPIO48 + 独立线程（PinDriver，Condvar 事件驱动）
     ├── wifi_prov.rs        # BLE 配网（network_provisioning FFI，P3 已验证）
     ├── index.html          # 内嵌单页 Web UI（原 components/wol_http/index.html）
     ├── control_http.rs     # EspHttpServer（index.html include_str 内嵌）
-    └── control_mqtt.rs     # EspMqttClient 回调 + FFI publish/subscribe
+    └── control_mqtt.rs     # EspMqttClient::new + 事件循环线程（阻塞 connection.next()）
 ```
