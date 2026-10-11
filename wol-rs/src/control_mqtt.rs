@@ -10,12 +10,17 @@
 //!
 //! 生命周期用 esp-idf-svc 的 `EspMqttClient`：`EspMqttClient::new` 返回
 //! `(client, connection)`，由一个专属线程持有 `connection` 并用阻塞的
-//! `connection.next()` 驱动事件循环；发布/订阅通过全局 `CLIENT`（`Mutex`）
-//! 调用 `client.publish/subscribe`。相比原回调 + 裸 FFI publish 的写法，
-//! 不再需要 `AtomicPtr` 与手工 CString。
+//! `connection.next()` 驱动事件循环。
+//!
+//! **线程模型（重要）**：espressif/mqtt 1.1.0 起任务循环在 API 锁内分发事件
+//! （`MQTT_API_LOCK → run_event_loop → dispatch → 回调 share() 阻塞`），
+//! 因此**事件处理路径上禁止调用任何 client API**（subscribe/publish 会与
+//! mqtt 任务互相等待而死锁）。所有 subscribe/publish 都入队给专属的
+//! `mqtt_api` 工作线程执行；事件线程只解析命令并入队。
 
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 
@@ -34,8 +39,11 @@ use crate::wol;
 
 static CONNECTED: AtomicBool = AtomicBool::new(false);
 
-/// 客户端句柄（事件线程与 HTTP 线程通过它发布/订阅）。
-static CLIENT: Mutex<Option<EspMqttClient<'static>>> = Mutex::new(None);
+/// API 工作线程的入队口（None = 客户端未启动/已停止）
+static API_TX: Mutex<Option<mpsc::Sender<ApiOp>>> = Mutex::new(None);
+/// API 工作线程，`stop()` 时先关队列再 join（线程退出时 drop client，
+/// 从而关闭事件通道让事件线程退出）
+static WORKER_THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 /// 事件循环线程，`stop()` 时 join。
 static EVENT_THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
@@ -55,29 +63,25 @@ static ACC: Mutex<(Vec<u8>, usize)> = Mutex::new((Vec::new(), 0));
 /// 命令缓冲上限（对应 C 版 s_cmd[256]：255 字节 + NUL）
 const MAX_CMD_LEN: usize = 255;
 
-/// 对应 C 版 publish_status()：发布原始字符串到 status 主题（QoS 1）
+/// API 工作线程的操作队列（在事件处理路径外执行 client API）
+enum ApiOp {
+    SubscribeAll,
+    Publish(String),
+}
+
+/// 对应 C 版 publish_status()：发布原始字符串到 status 主题（QoS 1）。
+/// 经 API 工作线程执行（事件处理路径不可直接调用 client API）。
 fn publish_status(msg: &str) {
     // MQTT 发送活动指示
     led_status::activity();
 
-    let mut guard = CLIENT.lock().unwrap();
-    let Some(client) = guard.as_mut() else { return };
-    match client.publish(
-        ac::WOL_MQTT_STATUS_TOPIC,
-        QoS::AtLeastOnce,
-        false,
-        msg.as_bytes(),
-    ) {
-        Ok(id) => ::log::info!(
-            "Publishing to \"{}\": \"{}\" (msg_id={})",
-            ac::WOL_MQTT_STATUS_TOPIC,
-            msg,
-            id
-        ),
-        Err(e) => ::log::error!(
-            "Failed to publish to \"{}\": {e:?}",
-            ac::WOL_MQTT_STATUS_TOPIC
-        ),
+    let tx = API_TX.lock().unwrap();
+    let Some(tx) = tx.as_ref() else {
+        ::log::warn!("MQTT publish skipped (client not started): {msg}");
+        return;
+    };
+    if tx.send(ApiOp::Publish(msg.to_string())).is_err() {
+        ::log::warn!("MQTT publish skipped (worker gone): {msg}");
     }
 }
 
@@ -241,33 +245,17 @@ fn handle_broadcast_command(cmd: &str) {
     }
 }
 
-/// 事件回调（在事件线程中调用，对应 C 版 mqtt_event_handler）
+/// 事件回调（在事件线程中调用，对应 C 版 mqtt_event_handler）。
+/// 注意：此路径上禁止直接调用 client API（死锁），一律经 API_TX 入队。
 fn handle_event(event: &EspMqttEvent<'_>) {
     match event.payload() {
         EventPayload::Connected(_) => {
             CONNECTED.store(true, Ordering::SeqCst);
 
-            // 订阅四个主题（client 在 start() 中已写入，此处必然可用）
-            {
-                let Some(topics) = TOPICS.get() else { return };
-                let mut guard = CLIENT.lock().unwrap();
-                if let Some(client) = guard.as_mut() {
-                    for (label, t) in [
-                        ("broadcast", &topics.bcast),
-                        ("wake", &topics.wake),
-                        ("mac", &topics.mac),
-                        ("mac get", &topics.mac_get),
-                    ] {
-                        match client.subscribe(t, QoS::AtLeastOnce) {
-                            Ok(id) => {
-                                ::log::info!("Subscribed to {label} topic {t} (msg_id={id})")
-                            }
-                            Err(e) => ::log::error!("Failed to subscribe to {label} topic {t}: {e:?}"),
-                        }
-                    }
-                }
+            // 订阅四个主题 + 上线通告：全部交 API 工作线程执行
+            if let Some(tx) = API_TX.lock().unwrap().as_ref() {
+                let _ = tx.send(ApiOp::SubscribeAll);
             }
-
             publish_status("online");
         }
 
@@ -379,6 +367,51 @@ fn mqtt_event_loop(mut connection: EspMqttConnection) {
     ::log::info!("MQTT event loop terminated");
 }
 
+/// API 工作线程：独占 client，串行执行所有 subscribe/publish。
+/// 队列关闭（发送端 drop）后退出，client 随之 drop 并关闭事件通道。
+fn api_worker(mut client: EspMqttClient<'static>, rx: mpsc::Receiver<ApiOp>) {
+    while let Ok(op) = rx.recv() {
+        match op {
+            ApiOp::SubscribeAll => {
+                let Some(topics) = TOPICS.get() else { continue };
+                for (label, t) in [
+                    ("broadcast", &topics.bcast),
+                    ("wake", &topics.wake),
+                    ("mac", &topics.mac),
+                    ("mac get", &topics.mac_get),
+                ] {
+                    match client.subscribe(t, QoS::AtLeastOnce) {
+                        Ok(id) => ::log::info!("Subscribed to {label} topic {t} (msg_id={id})"),
+                        Err(e) => {
+                            ::log::error!("Failed to subscribe to {label} topic {t}: {e:?}")
+                        }
+                    }
+                }
+            }
+            ApiOp::Publish(msg) => {
+                match client.publish(
+                    ac::WOL_MQTT_STATUS_TOPIC,
+                    QoS::AtLeastOnce,
+                    false,
+                    msg.as_bytes(),
+                ) {
+                    Ok(id) => ::log::info!(
+                        "Publishing to \"{}\": \"{}\" (msg_id={})",
+                        ac::WOL_MQTT_STATUS_TOPIC,
+                        msg,
+                        id
+                    ),
+                    Err(e) => ::log::error!(
+                        "Failed to publish to \"{}\": {e:?}",
+                        ac::WOL_MQTT_STATUS_TOPIC
+                    ),
+                }
+            }
+        }
+    }
+    ::log::info!("MQTT API worker terminated");
+}
+
 /// 对应 C 版 dns_debug_task()：一次性 DNS 诊断日志
 fn dns_debug(uri: String) {
     let after = uri.split("://").nth(1).unwrap_or(uri.as_str());
@@ -453,7 +486,15 @@ pub fn start() -> Result<(), MqttStartError> {
     let (client, connection) =
         EspMqttClient::new(&cfg.mqtt_uri, &conf).map_err(MqttStartError::Init)?;
 
-    *CLIENT.lock().unwrap() = Some(client);
+    // API 工作线程独占 client（见模块注释：事件路径禁止直接调用 client API）
+    let (api_tx, api_rx) = mpsc::channel::<ApiOp>();
+    *API_TX.lock().unwrap() = Some(api_tx);
+    let worker = std::thread::Builder::new()
+        .name("mqtt_api".into())
+        .stack_size(6144)
+        .spawn(move || api_worker(client, api_rx))
+        .map_err(MqttStartError::Thread)?;
+    *WORKER_THREAD.lock().unwrap() = Some(worker);
 
     // 事件处理含 serde_json 解析/序列化 + 大 FFI 栈结构（wifi_ap_record_t 约
     // 800B）+ localtime_r 等，4KB 会顶穿栈金丝雀导致整机遇测复位；旧实现跑在
@@ -483,11 +524,12 @@ pub fn start() -> Result<(), MqttStartError> {
 pub fn stop() {
     CONNECTED.store(false, Ordering::SeqCst);
 
-    // 取出 client 后立即释放锁，再 drop：drop 会销毁底层 client 并关闭事件
-    // 通道，事件线程随之退出，然后 join。
-    let client = CLIENT.lock().unwrap().take();
-    drop(client);
-
+    // 关闭 API 队列 → 工作线程退出并 drop client → 事件通道关闭 →
+    // 事件线程退出；最后 join 两个线程
+    API_TX.lock().unwrap().take();
+    if let Some(handle) = WORKER_THREAD.lock().unwrap().take() {
+        let _ = handle.join();
+    }
     if let Some(handle) = EVENT_THREAD.lock().unwrap().take() {
         let _ = handle.join();
     }

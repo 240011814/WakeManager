@@ -196,6 +196,14 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
   `EspNvs::new(..., readwrite=false)` 返回 `ESP_ERR_NVS_NOT_FOUND`，
   `config_store::init`/`mac_store::init` 原样上抛导致 `abort()` 重启循环；
   现按"无存储配置，用默认值"处理。
+- **修复 MQTT 事件路径死锁**（Wokwi 模拟发现，2026-10-11）：espressif/mqtt
+  组件重建时经浮动版本 `1.*` 拉到 1.1.0（事件循环新架构），mqtt 任务在 API 锁内
+  分发事件，事件处理路径上调用 subscribe/publish 会与 mqtt 任务互相等待死锁
+  （表象：连接成功但无订阅/上线日志，平台看不到设备）。`control_mqtt` 重构为
+  API 工作线程架构：client 由专属 `mqtt_api` 线程独占，事件线程与 HTTP 线程
+  只通过队列投递 SubscribeAll/Publish 操作。
+- 模拟验证结论：连接 → 四主题订阅 → `online` 发布全部成功；Wokwi NAT 约 25s
+  断开长连接并自动重连（模拟器限制，真机不受影响）。
 
 ## 目录
 
