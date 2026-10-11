@@ -5,3 +5,7 @@
 /managed_components
 /dependencies.lock
 /build
+
+# VS Code：本机路径配置不入库（extensions.json 推荐清单除外）
+.vscode/settings.json
+.vscode/launch.json

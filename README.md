@@ -85,6 +85,22 @@ cargo espflash flash --monitor                 # 自定义分区表已编进构�
 > 路径检查时又解析回短位置。换机器重建：
 > `powershell "New-Item -ItemType Junction -Path D:\WakeManager\target -Target D:\espbuild"`。
 
+## VS Code
+
+推荐扩展（打开仓库会自动提示安装，见 `.vscode/extensions.json`）：
+**rust-analyzer**（代码智能主体）、**ESP-IDF 扩展**（KConfig 高亮 / Monitor / 调试）、
+**Wokwi 扩展**（读取 `wokwi.toml` 直接跑模拟）。
+
+- 构建/烧录/模拟都走 cargo（`cargo build`、`cargo espflash flash --monitor`、
+  `mkwokwi.sh`），IDF 插件的 idf.py 构建按钮对 Rust 工程不适用（无 CMakeLists）。
+- ESP-IDF 扩展首次使用需运行 setup 向导：IDF 路径 `D:\esptools\esp-idf\v6.1`、
+  tools 路径 `D:\esptools`。
+- **USB-JTAG 源码级调试**：`cargo espflash flash` 烧录后，用调试面板的
+  "wol-rs: USB-JTAG 调试（ESP32-S3）"（`launch.json` 指向 Rust elf + esp-gdb +
+  OpenOCD，本机路径配置不入库；已通过 `idf_tools.py install
+  xtensa-esp-elf-gdb openocd-esp32` 装好）。注意 rust-analyzer 的 check 与
+  终端构建不要并发（会撞 CMake 构建锁）。
+
 ## Wokwi 本地模拟
 
 固件可在 [Wokwi](https://wokwi.com)（云端仿真，本机 CLI 驱动）跑 smoke test。

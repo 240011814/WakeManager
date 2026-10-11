@@ -1,0 +1,8 @@
+{
+    "recommendations": [
+        "rust-lang.rust-analyzer",
+        "espressif.esp-idf-extension",
+        "espressif.esp-idf-extension-pack",
+        "wokwi.wokwi-vscode"
+    ]
+}
