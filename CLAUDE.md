@@ -264,7 +264,7 @@ WakeManager/
 - **NVS blob 兼容**：`config_store`（260B）与 `mac_store`（341B）刻意保持与原 C `repr(C)` 结构逐字节一致；修改字段布局会使旧配置失效。
 - **ffi / 宏不可见**：`TEMPERATURE_SENSOR_CONFIG_DEFAULT()`、`NETWORK_PROV_EVENT_HANDLER_*` 等含复合字面量的宏 bindgen 不可见，需手工构造结构体（见 `wifi_prov.rs` / `chip_temp.rs`）。`WIFI_INIT_CONFIG_DEFAULT()` 同样不可见，但其字段值**全部取自 esp-idf-sys 生成的 `WIFI_*` / `CONFIG_*` 常量**（与 esp-idf-svc 内部一致），改 menuconfig 会自动跟随，无需手工同步。
 - **bindgen 命名**：枚举常量名通常去掉了类型 `_t` 后缀（如 `network_prov_security_NETWORK_PROV_SECURITY_1`）；`ssize_t` 绑定为 `isize`。以 `_t_` 开头的 bindgen 常量在 `match` 中触发 `non_upper_case_globals` 警告，可在函数上加 `#[allow(non_upper_case_globals)]`。
-- **MQTT 生命周期**：`control_mqtt.rs` 用 `EspMqttClient::new` 得到 `(client, connection)`：client 存全局 `Mutex`（供发布/订阅），connection 交给专属线程用阻塞的 `connection.next()` 驱动事件循环。`stop()` 取出并 drop client 以关闭事件通道，再 join 线程——**取出后先释放锁再 drop**，避免与事件线程抢锁死锁。状态主题统一取自 `app_config`。
+- **MQTT 生命周期**：`control_mqtt.rs` 用 `EspMqttClient::new` 得到 `(client, connection)`：client 存全局 `Mutex`（供发布/订阅），connection 交给专属线程用阻塞的 `connection.next()` 驱动事件循环。`stop()` 取出并 drop client 以关闭事件通道，再 join 线程——**取出后先释放锁再 drop**，避免与事件线程抢锁死锁。状态主题统一取自 `app_config`。**事件线程栈必须 ≥8192**：事件处理含 serde_json 与大 FFI 栈结构（`wifi_ap_record_t` 约 800B），4KB 会触发栈金丝雀整机遇测复位（表象为发现命令无应答）。**client id 每设备唯一**（`wakemanager-<设备id>`），固定 ID 会被 broker 互踢导致发现时好时坏。esp-idf-svc 的事件通道为单槽阻塞式：事件处理期间 esp-mqtt C 任务阻塞在 `share()`，处理必须短平快（勿长阻塞，否则 keepalive 超时被 broker 断开）。
 - **HTTP 服务器持有**：`EspHttpServer` 非 `Send`（内含裸指针），`control_http.rs` 在专属线程内创建并持有它（不跨线程移动），因此无需 `unsafe impl Send/Sync`；`start()` 通过 channel 等待线程回报启动结果。
 - **等待 IP**：`wifi_prov::wait_connected()` 用 `Mutex<bool> + Condvar` 阻塞等待（事件回调里 `notify_all`），不再轮询。
 - **MQTT 数据不是 NUL 结尾**：`EventPayload::Received` 的 `topic`/`data` 需按长度/UTF-8 处理，避免越界。

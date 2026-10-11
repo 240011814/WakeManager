@@ -431,8 +431,11 @@ pub fn start() -> Result<(), MqttStartError> {
         })
         .ok();
 
+    // client id 追加设备 id：broker 对相同 client id 会挤掉旧连接，固定 ID
+    // 会让多台设备（或同名测试客户端）互踢，发现时好时坏
+    let client_id = format!("{}-{}", ac::WOL_MQTT_CLIENT_ID, dev_id);
     let conf = MqttClientConfiguration {
-        client_id: Some(ac::WOL_MQTT_CLIENT_ID),
+        client_id: Some(client_id.as_str()),
         username: (!cfg.mqtt_username.is_empty()).then_some(cfg.mqtt_username.as_str()),
         password: (!cfg.mqtt_password.is_empty()).then_some(cfg.mqtt_password.as_str()),
         ..Default::default()
@@ -443,9 +446,12 @@ pub fn start() -> Result<(), MqttStartError> {
 
     *CLIENT.lock().unwrap() = Some(client);
 
+    // 事件处理含 serde_json 解析/序列化 + 大 FFI 栈结构（wifi_ap_record_t 约
+    // 800B）+ localtime_r 等，4KB 会顶穿栈金丝雀导致整机遇测复位；旧实现跑在
+    // esp-mqtt 任务（默认 6144）上，这里给到 8192 留足余量
     let handle = std::thread::Builder::new()
         .name("mqtt_events".into())
-        .stack_size(4096)
+        .stack_size(8192)
         .spawn(move || mqtt_event_loop(connection))
         .map_err(MqttStartError::Thread)?;
     *EVENT_THREAD.lock().unwrap() = Some(handle);
