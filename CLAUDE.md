@@ -110,8 +110,12 @@
 cd wol-rs
 cargo build
 
-# 烧录 + 串口监视（自定义分区表必须显式传入，esp-idf-sys 已知限制）
-cargo espflash flash --monitor --partition-table ../partitions.csv
+# 烧录 + 串口监视（自定义分区表已编进构建，无需额外参数）
+cargo espflash flash --monitor
+
+# Wokwi 本地模拟（WOKWI_CLI_TOKEN 见 https://wokwi.com/dashboard/ci）
+cargo build --features sim && ./mkwokwi.sh
+wokwi-cli --expect-text "WakeManager ready" --fail-text "Guru Meditation" --timeout 90000 .
 
 # 清理
 cargo clean
@@ -123,10 +127,10 @@ cargo clean
 
 ```
 WakeManager/
-├── partitions.csv              # 分区表（factory 从 0x180000 扩到 0x300000）
+├── partitions.csv              # 历史副本（权威：wol-rs/partitions.csv）
 ├── README.md / CLAUDE.md
 └── wol-rs/                     # Rust 固件工程（cargo）
-    ├── Cargo.toml              # 依赖 + esp-idf-sys extra_components（mqtt / network_provisioning）
+    ├── Cargo.toml              # 依赖 + esp-idf-sys extra_components（mqtt / network_provisioning）+ sim feature
     ├── build.rs                # embuild::espidf::sysenv::output()
     ├── bindings.h              # bindgen 入口（network_provisioning + chip/flash info）
     ├── rust-toolchain.toml     # channel = "esp"
@@ -269,7 +273,10 @@ WakeManager/
 - **等待 IP**：`wifi_prov::wait_connected()` 用 `Mutex<bool> + Condvar` 阻塞等待（事件回调里 `notify_all`），不再轮询。
 - **MQTT 数据不是 NUL 结尾**：`EventPayload::Received` 的 `topic`/`data` 需按长度/UTF-8 处理，避免越界。
 - **看门狗**：`watchdog::init()` 会 `reconfigure`（IDF 默认已 `CONFIG_ESP_TASK_WDT_INIT` 自动初始化）；等待配网期间不要提前把主任务加入看门狗，应在开始循环喂狗后再 `add_current_task()`。
-- **SNTP**：`esp_sntp_setservername` 只存指针不拷贝 → 需 `Box::leak` 一份静态字符串；时区用 `setenv("TZ", ...)` + `tzset()`。
-- **`partitions.csv`**：Rust 镜像约 1.8MB，factory 分区已扩到 0x300000；esp-idf-sys 不能在 `sdkconfig.defaults` 里定义自定义分区表，烧录时用 `--partition-table` 指定。
+- **SNTP**：现在走 esp-idf-svc 的 `EspSntp`（server 字符串生命周期由句柄托管，`main()` 保活）；时区仍用 `setenv("TZ", ...)` + `tzset()`（0.53 的 `SntpConf` 无 timezone 字段）。
+- **分区表**：`wol-rs/partitions.csv`（factory 0x300000）通过 `CONFIG_PARTITION_TABLE_CUSTOM=y` 编进构建；esp-idf-sys 的限制是**相对路径被解析到 cargo OUT_DIR**，`CUSTOM_FILENAME` 必须写绝对路径（换机器需同步改 sdkconfig.defaults）。flash size 相应设为 4MB。
+- **Windows 构建目录**：esp-idf-sys 要求 canonicalize 后的 OUT_DIR ≤ 88 字符；`wol-rs/target` 是指向短路径（`D:\espbuild`）的 NTFS junction——产物在项目内可见、检查时解析回短路径。换机器需重建 junction（`New-Item -ItemType Junction`），不能用 subst（canonicalize 会还原成原长路径）。
+- **NVS 全新 flash 首启**：只读 `EspNvs::new(..., false)` 在命名空间不存在时返回 `ESP_ERR_NVS_NOT_FOUND`，`config_store`/`mac_store` 的 `init` 必须按"无存储配置"处理而非上抛（此 bug 由 Wokwi 模拟发现——真机全擦后首启会 abort 重启循环）。
+- **Wokwi 模拟**：不支持 BLE → `sim` feature 跳过配网直连 `Wokwi-GUEST`；`wokwi.toml` 不要设 `gdbServerPort`（会暂停仿真等 GDB）；esp-idf-sys 的 CMake 产物 `libespidf.bin` 不含 Rust 代码，模拟镜像必须用 cargo elf 经 `esptool elf2image` 转换（`mkwokwi.sh`）。
 - **日志时间戳**：`CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y`，串口日志显示 `HH:MM:SS.sss`（本地时间）；SNTP 校时前为 epoch。
 - **`unsafe` 边界**：FFI 调用集中在各模块，回调用 `unsafe extern "C" fn`；`EspHttpServer` 与 MQTT 客户端都由各自专属线程持有，避免跨线程移动非 `Send` 类型。

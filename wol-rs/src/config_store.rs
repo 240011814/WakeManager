@@ -8,7 +8,7 @@
 use std::sync::{Mutex, OnceLock};
 
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
-use esp_idf_svc::sys::EspError;
+use esp_idf_svc::sys::{EspError, ESP_ERR_NVS_NOT_FOUND};
 
 use crate::app_config as ac;
 
@@ -109,17 +109,26 @@ fn writable_nvs(
 pub fn init(partition: EspDefaultNvsPartition) -> Result<(), EspError> {
     let mut cfg = WmConfig::defaults();
 
-    let nvs = EspNvs::new(partition.clone(), NVS_NAMESPACE, false)?;
-    let mut buf = [0u8; CFG_BLOB_LEN];
-    match nvs.get_blob(NVS_KEY, &mut buf) {
-        Ok(Some(data)) if data.len() == CFG_BLOB_LEN => match WmConfig::decode(data) {
-            Some(c) => {
-                cfg = c;
-                log::info!("Config loaded from NVS");
+    // 只读打开；全新 flash 上命名空间尚不存在（NVS_NOT_FOUND）→ 用默认值
+    // （此路径由 Wokwi 模拟发现：原实现直接 `?` 上抛导致全新设备 abort 循环）
+    let loaded = match EspNvs::new(partition.clone(), NVS_NAMESPACE, false) {
+        Ok(nvs) => {
+            let mut buf = [0u8; CFG_BLOB_LEN];
+            match nvs.get_blob(NVS_KEY, &mut buf) {
+                Ok(Some(data)) if data.len() == CFG_BLOB_LEN => WmConfig::decode(data),
+                _ => None,
             }
-            None => log::info!("No stored config, using defaults"),
-        },
-        _ => log::info!("No stored config, using defaults"),
+        }
+        Err(e) if e.code() == ESP_ERR_NVS_NOT_FOUND as i32 => None,
+        Err(e) => return Err(e),
+    };
+
+    match loaded {
+        Some(c) => {
+            cfg = c;
+            log::info!("Config loaded from NVS");
+        }
+        None => log::info!("No stored config, using defaults"),
     }
 
     let _ = PARTITION.set(partition);

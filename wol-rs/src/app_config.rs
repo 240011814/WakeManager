@@ -36,12 +36,17 @@ pub const TIME_TIMEZONE: &str = "CST-8";
 pub const WATCHDOG_TIMEOUT_MS: u32 = 30_000;
 pub const WATCHDOG_TRIGGER_PANIC: bool = true;
 
-/* ---------- Wi-Fi provisioning (BLE transport) ---------- */
-
+/* ---------- Wi-Fi provisioning (BLE transport) ----------
+ * （sim 模拟构建跳过配网，这些常量随之不用） */
+#[cfg(not(feature = "sim"))]
 pub const PROV_POP: &str = "12345678";
+#[cfg(not(feature = "sim"))]
 pub const PROV_DEVICE_NAME_PREFIX: &str = "PROV_";
+#[cfg(not(feature = "sim"))]
 pub const PROV_QR_VERSION: &str = "v1";
+#[cfg(not(feature = "sim"))]
 pub const PROV_QR_TRANSPORT: &str = "ble";
+#[cfg(not(feature = "sim"))]
 pub const PROV_QRCODE_BASE_URL: &str =
     "https://espressif.github.io/esp-jumpstart/qrcode.html";
 

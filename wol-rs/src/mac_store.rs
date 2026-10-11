@@ -7,7 +7,7 @@
 use std::sync::{Mutex, OnceLock};
 
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
-use esp_idf_svc::sys::EspError;
+use esp_idf_svc::sys::{EspError, ESP_ERR_NVS_NOT_FOUND};
 
 use crate::app_config as ac;
 use crate::wol;
@@ -66,18 +66,29 @@ fn writable_nvs(
 pub fn init(partition: EspDefaultNvsPartition) -> Result<(), EspError> {
     let mut table = MacTable::default();
 
-    let nvs = EspNvs::new(partition.clone(), NVS_NAMESPACE, false)?;
-    let mut buf = [0u8; BLOB_LEN];
-    match nvs.get_blob(NVS_KEY, &mut buf) {
-        Ok(Some(data)) if data.len() == BLOB_LEN => {
-            table = decode(data);
+    // 只读打开；全新 flash 上命名空间尚不存在（NVS_NOT_FOUND）→ 空表起步
+    let loaded = match EspNvs::new(partition.clone(), NVS_NAMESPACE, false) {
+        Ok(nvs) => {
+            let mut buf = [0u8; BLOB_LEN];
+            match nvs.get_blob(NVS_KEY, &mut buf) {
+                Ok(Some(data)) if data.len() == BLOB_LEN => Some(decode(data)),
+                _ => None,
+            }
+        }
+        Err(e) if e.code() == ESP_ERR_NVS_NOT_FOUND as i32 => None,
+        Err(e) => return Err(e),
+    };
+
+    match loaded {
+        Some(t) => {
+            table = t;
             log::info!(
                 "Address book loaded: {} entr{}",
                 table.entries.len(),
                 if table.entries.len() == 1 { "y" } else { "ies" }
             );
         }
-        _ => log::info!("No stored address book, starting empty"),
+        None => log::info!("No stored address book, starting empty"),
     }
 
     let _ = PARTITION.set(partition);

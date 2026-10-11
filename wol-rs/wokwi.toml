@@ -1,0 +1,16 @@
+# Wokwi 模拟配置（wokwi-cli 或 Wokwi for VS Code 使用）
+#
+# firmware 指向 build/flasher_args.json：Wokwi 按它装配完整 flash 镜像
+# （bootloader @0x0 + 自定义分区表 @0x8000 + app @0x10000），
+# 与 idf.py flash 的行为一致。build/ 由 mkwokwi.sh 组装。
+#
+# 模拟流程：
+#   cargo build --features sim      # sim 特性：跳过 BLE 配网，直连 Wokwi-GUEST
+#   ./mkwokwi.sh                    # 组装 build/
+#   wokwi-cli .                     # 需先 export WOKWI_CLI_TOKEN=...（wokwi.com 免费获取）
+[wokwi]
+version = 1
+# 注意：不要设置 gdbServerPort —— 会让仿真暂停等待 GDB 连接（仅调试时用 CLI 的 --gdb-server-port）
+# elf 路径相对本文件（<crate>/target，由 mkwokwi.sh / cargo build --features sim 生成）
+elf = "target/xtensa-esp32s3-espidf/debug/wol-rs"
+firmware = "build/flasher_args.json"

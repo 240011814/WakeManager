@@ -3,6 +3,7 @@
 //!
 //! 所有 Wi-Fi / 配网配置都在这里；app_main 只调用 `start()` 和 `wait_connected()`。
 //! 依赖 `network_provisioning` 托管组件的 FFI 绑定（P3 原型已验证）。
+//! `sim` feature（Wokwi 模拟构建）下跳过配网管理器，直接 STA 连接模拟 AP。
 
 use std::ffi::c_void;
 use std::ptr;
@@ -10,6 +11,7 @@ use std::sync::{Condvar, Mutex};
 
 use esp_idf_sys::*;
 
+#[cfg(not(feature = "sim"))]
 use crate::app_config as ac;
 use crate::led_status;
 
@@ -169,6 +171,7 @@ unsafe extern "C" fn event_handler(
 ///
 /// # Safety
 /// inbuf/outbuf 由调用方（protocomm）保证有效；这里只做一次性读写。
+#[cfg(not(feature = "sim"))]
 unsafe extern "C" fn custom_data_handler(
     _session_id: u32,
     inbuf: *const u8,
@@ -199,6 +202,7 @@ fn check(err: esp_err_t, ctx: &str) {
 
 /// BLE 名称 / 服务名：`PROV_` + STA MAC 后 3 字节（与 C 版一致）。
 /// `esp_wifi_get_mac` 失败时返回 `None`（调用方回退到全零后缀并记录）。
+#[cfg(not(feature = "sim"))]
 fn device_service_name() -> Option<std::ffi::CString> {
     match crate::device_info::get_mac() {
         Ok(mac) => Some(
@@ -219,6 +223,7 @@ fn device_service_name() -> Option<std::ffi::CString> {
 }
 
 /// 对应 C 版 prov_print_qr()：打印配网 payload（日志用）
+#[cfg(not(feature = "sim"))]
 fn prov_print_qr(name: &str, pop: &str) {
     let payload = format!(
         "{{\"ver\":\"{}\",\"name\":\"{}\",\"pop\":\"{}\",\"transport\":\"{}\"}}",
@@ -241,34 +246,39 @@ pub fn start() {
         check(esp_netif_init(), "esp_netif_init");
         check(esp_event_loop_create_default(), "esp_event_loop_create_default");
 
-        // ---- 订阅配网 / BLE 传输 / 安全会话 / IP 事件 ----
-        check(
-            esp_event_handler_register(
-                NETWORK_PROV_EVENT,
-                ESP_EVENT_ANY_ID,
-                Some(event_handler),
-                ptr::null_mut(),
-            ),
-            "register NETWORK_PROV_EVENT",
-        );
-        check(
-            esp_event_handler_register(
-                PROTOCOMM_TRANSPORT_BLE_EVENT,
-                ESP_EVENT_ANY_ID,
-                Some(event_handler),
-                ptr::null_mut(),
-            ),
-            "register PROTOCOMM_TRANSPORT_BLE_EVENT",
-        );
-        check(
-            esp_event_handler_register(
-                PROTOCOMM_SECURITY_SESSION_EVENT,
-                ESP_EVENT_ANY_ID,
-                Some(event_handler),
-                ptr::null_mut(),
-            ),
-            "register PROTOCOMM_SECURITY_SESSION_EVENT",
-        );
+        // ---- 订阅配网 / BLE 传输 / 安全会话事件（模拟构建跳过配网）----
+        #[cfg(not(feature = "sim"))]
+        {
+            check(
+                esp_event_handler_register(
+                    NETWORK_PROV_EVENT,
+                    ESP_EVENT_ANY_ID,
+                    Some(event_handler),
+                    ptr::null_mut(),
+                ),
+                "register NETWORK_PROV_EVENT",
+            );
+            check(
+                esp_event_handler_register(
+                    PROTOCOMM_TRANSPORT_BLE_EVENT,
+                    ESP_EVENT_ANY_ID,
+                    Some(event_handler),
+                    ptr::null_mut(),
+                ),
+                "register PROTOCOMM_TRANSPORT_BLE_EVENT",
+            );
+            check(
+                esp_event_handler_register(
+                    PROTOCOMM_SECURITY_SESSION_EVENT,
+                    ESP_EVENT_ANY_ID,
+                    Some(event_handler),
+                    ptr::null_mut(),
+                ),
+                "register PROTOCOMM_SECURITY_SESSION_EVENT",
+            );
+        }
+
+        // ---- 订阅 IP 事件（配网与直连两条路径共用）----
         check(
             esp_event_handler_register(
                 IP_EVENT,
@@ -284,74 +294,13 @@ pub fn start() {
         let wifi_cfg = wifi_init_config_default();
         check(esp_wifi_init(&wifi_cfg), "esp_wifi_init");
 
-        // ---- 配网管理器配置：BLE GATT 传输 ----
-        // C 宏 NETWORK_PROV_EVENT_HANDLER_* / *_FREE_BTDM 是复合字面量，
-        // bindgen 不可见 → 手工构造同构结构体
-        let mut prov_cfg: network_prov_mgr_config_t = std::mem::zeroed();
-        prov_cfg.scheme = ptr::read(&raw const network_prov_scheme_ble);
-        // 配网结束后释放 BT/BLE 内存（WakeManager 之后不需要蓝牙）
-        prov_cfg.scheme_event_handler = network_prov_event_handler_t {
-            event_cb: Some(network_prov_scheme_ble_event_cb_free_btdm),
-            user_data: ptr::null_mut(),
-        };
-        prov_cfg.app_event_handler = network_prov_event_handler_t {
-            event_cb: None,
-            user_data: ptr::null_mut(),
-        };
-        check(network_prov_mgr_init(prov_cfg), "network_prov_mgr_init");
-
-        let mut provisioned: bool = false;
-        check(
-            network_prov_mgr_is_wifi_provisioned(&mut provisioned),
-            "network_prov_mgr_is_wifi_provisioned",
-        );
-
-        if !provisioned {
-            ::log::info!("Device is not provisioned, starting BLE provisioning");
-
-            let service_name = device_service_name().unwrap_or_else(|| {
-                std::ffi::CString::new(format!("{}000000", ac::PROV_DEVICE_NAME_PREFIX))
-                    .expect("service name has no NUL")
-            });
-
-            // 可选自定义端点：先 create（start 之前），start 之后再 register
-            let ep_name = c"custom-data";
-            check(
-                network_prov_mgr_endpoint_create(ep_name.as_ptr()),
-                "endpoint_create",
+        // ---- 模拟构建：跳过 BLE 配网（模拟器不支持蓝牙），直连模拟 AP ----
+        #[cfg(feature = "sim")]
+        {
+            ::log::warn!(
+                "Simulation build (feature sim): BLE provisioning disabled, \
+                 connecting to Wokwi-GUEST directly"
             );
-
-            // Security 1：X25519 密钥交换 + PoP + AES-CTR；pop 需在配网期间保持有效
-            let pop = std::ffi::CString::new(ac::PROV_POP).expect("pop has no NUL");
-            check(
-                network_prov_mgr_start_provisioning(
-                    network_prov_security_NETWORK_PROV_SECURITY_1,
-                    pop.as_ptr() as *const c_void,
-                    service_name.as_ptr(),
-                    ptr::null(),
-                ),
-                "start_provisioning",
-            );
-            check(
-                network_prov_mgr_endpoint_register(
-                    ep_name.as_ptr(),
-                    Some(custom_data_handler),
-                    ptr::null_mut(),
-                ),
-                "endpoint_register",
-            );
-
-            prov_print_qr(
-                &service_name.to_string_lossy(),
-                ac::PROV_POP,
-            );
-        } else {
-            ::log::info!("Device is already provisioned, starting Wi-Fi STA");
-
-            // 不再需要配网管理器
-            check(network_prov_mgr_deinit(), "network_prov_mgr_deinit");
-
-            // 启用重连处理并连接到已存 AP
             check(
                 esp_event_handler_register(
                     WIFI_EVENT,
@@ -362,7 +311,98 @@ pub fn start() {
                 "register WIFI_EVENT",
             );
             check(esp_wifi_set_mode(wifi_mode_t_WIFI_MODE_STA), "set_mode");
+            let mut wifi_cfg: wifi_config_t = std::mem::zeroed();
+            wifi_cfg.sta.ssid[..b"Wokwi-GUEST".len()].copy_from_slice(b"Wokwi-GUEST");
+            // password 保持全零 = 开放网络
+            check(
+                esp_wifi_set_config(wifi_interface_t_WIFI_IF_STA, &mut wifi_cfg),
+                "set_config",
+            );
             check(esp_wifi_start(), "esp_wifi_start");
+        }
+
+        // ---- 配网管理器配置：BLE GATT 传输 ----
+        #[cfg(not(feature = "sim"))]
+        {
+            // C 宏 NETWORK_PROV_EVENT_HANDLER_* / *_FREE_BTDM 是复合字面量，
+            // bindgen 不可见 → 手工构造同构结构体
+            let mut prov_cfg: network_prov_mgr_config_t = std::mem::zeroed();
+            prov_cfg.scheme = ptr::read(&raw const network_prov_scheme_ble);
+            // 配网结束后释放 BT/BLE 内存（WakeManager 之后不需要蓝牙）
+            prov_cfg.scheme_event_handler = network_prov_event_handler_t {
+                event_cb: Some(network_prov_scheme_ble_event_cb_free_btdm),
+                user_data: ptr::null_mut(),
+            };
+            prov_cfg.app_event_handler = network_prov_event_handler_t {
+                event_cb: None,
+                user_data: ptr::null_mut(),
+            };
+            check(network_prov_mgr_init(prov_cfg), "network_prov_mgr_init");
+
+            let mut provisioned: bool = false;
+            check(
+                network_prov_mgr_is_wifi_provisioned(&mut provisioned),
+                "network_prov_mgr_is_wifi_provisioned",
+            );
+
+            if !provisioned {
+                ::log::info!("Device is not provisioned, starting BLE provisioning");
+
+                let service_name = device_service_name().unwrap_or_else(|| {
+                    std::ffi::CString::new(format!("{}000000", ac::PROV_DEVICE_NAME_PREFIX))
+                        .expect("service name has no NUL")
+                });
+
+                // 可选自定义端点：先 create（start 之前），start 之后再 register
+                let ep_name = c"custom-data";
+                check(
+                    network_prov_mgr_endpoint_create(ep_name.as_ptr()),
+                    "endpoint_create",
+                );
+
+                // Security 1：X25519 密钥交换 + PoP + AES-CTR；pop 需在配网期间保持有效
+                let pop = std::ffi::CString::new(ac::PROV_POP).expect("pop has no NUL");
+                check(
+                    network_prov_mgr_start_provisioning(
+                        network_prov_security_NETWORK_PROV_SECURITY_1,
+                        pop.as_ptr() as *const c_void,
+                        service_name.as_ptr(),
+                        ptr::null(),
+                    ),
+                    "start_provisioning",
+                );
+                check(
+                    network_prov_mgr_endpoint_register(
+                        ep_name.as_ptr(),
+                        Some(custom_data_handler),
+                        ptr::null_mut(),
+                    ),
+                    "endpoint_register",
+                );
+
+                prov_print_qr(
+                    &service_name.to_string_lossy(),
+                    ac::PROV_POP,
+                );
+            } else {
+                ::log::info!("Device is already provisioned, starting Wi-Fi STA");
+
+                // 不再需要配网管理器
+                check(network_prov_mgr_deinit(), "network_prov_mgr_deinit");
+
+                // 启用重连处理并连接到已存 AP
+                check(
+                    esp_event_handler_register(
+                        WIFI_EVENT,
+                        ESP_EVENT_ANY_ID,
+                        Some(event_handler),
+                        ptr::null_mut(),
+                    ),
+                    "register WIFI_EVENT",
+                );
+                check(esp_wifi_set_mode(wifi_mode_t_WIFI_MODE_STA), "set_mode");
+                check(esp_wifi_start(), "esp_wifi_start");
+            }
         }
     }
 }

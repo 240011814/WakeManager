@@ -69,12 +69,43 @@ espup install --targets esp32s3 --std
 cd wol-rs
 cargo build                                    # rust-toolchain.toml 自动选 esp 工具链；
                                                # 首次构建会完整编译 ESP-IDF（10~20 分钟）
-cargo espflash flash --monitor \
-    --partition-table ../partitions.csv        # 自定义分区表需显式传入（esp-idf-sys 已知限制）
+cargo espflash flash --monitor                 # 自定义分区表已编进构建（见下），无需额外参数
 ```
 
-> `sdkconfig.defaults` 里**不能**定义 `CONFIG_PARTITION_TABLE_CUSTOM*`
-> （esp-idf-sys 已知限制），分区表在烧录时通过 `--partition-table` 指定。
+> **分区表**：`wol-rs/partitions.csv`（factory 3MB）通过 sdkconfig.defaults 的
+> `CONFIG_PARTITION_TABLE_CUSTOM=y` + `CONFIG_PARTITION_TABLE_CUSTOM_FILENAME`
+> **编进了构建**。实测 esp-idf-sys 的限制在于**相对路径会被解析到 cargo 的
+> OUT_DIR**，`CUSTOM_FILENAME` 必须写绝对路径（当前 sdkconfig.defaults 已如此
+> 配置；换机器/路径时需同步修改）。仓库根的 `partitions.csv` 仅作历史参考，
+> 权威文件是 `wol-rs/partitions.csv`。
+
+> **Windows 构建目录（本机环境要求）**：esp-idf-sys 在 Windows 上要求
+> canonicalize 后的 OUT_DIR ≤ 88 字符，因此 `target/` 实际是一个指向短路径
+> （如 `D:\espbuild`）的 **NTFS 目录联接**——产物在项目路径下可见可用，
+> 路径检查时又解析回短位置。换机器重建：
+> `powershell "New-Item -ItemType Junction -Path wol-rs\target -Target D:\espbuild"`。
+
+## Wokwi 本地模拟
+
+固件可在 [Wokwi](https://wokwi.com)（云端仿真，本机 CLI 驱动）跑 smoke test。
+**限制：Wokwi 不支持 BLE**，因此 `sim` feature 直接跳过配网、连接模拟 AP
+`Wokwi-GUEST`（仅用于模拟构建，真机固件不受影响）：
+
+```bash
+export WOKWI_CLI_TOKEN=...                     # wokwi.com/dashboard/ci 免费获取
+cd wol-rs
+cargo build --features sim                     # sim 固件（其余代码与真机一致）
+./mkwokwi.sh                                   # 组装 build/：bootloader + 自定义分区表 + 固件镜像
+wokwi-cli .                                    # 交互式串口 + 浏览器可视化
+# 自动 smoke test（串口断言）：
+wokwi-cli --expect-text "WakeManager ready" --fail-text "Guru Meditation" --timeout 90000 .
+```
+
+文件说明：`wokwi.toml`（elf + flasher_args 入口）、`diagram.json`
+（S3 板 + GPIO48 LED + 串口终端）、`mkwokwi.sh`（把 cargo 链接的固件 elf 经
+esptool `elf2image` 转成 app 镜像，连同 bootloader/分区表组装成
+`build/flasher_args.json` 可消费的布局；注意 esp-idf-sys CMake 产物
+`libespidf.bin` 不含 Rust 代码，不能直接当固件用）。
 
 ## FFI 绑定 network_provisioning 的机制
 
@@ -152,16 +183,34 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
 - `handle_wake_command` 的地址簿查询改写为 `Option` 链，移除带副作用的闭包；
   `main` 复用 `netinfo::free_heap()`；删除未调用的 `chip_temp::is_ready()`。
 
+## 优化记录（2026-10-11 第二批：模拟测试 + 修复）
+
+- **自定义分区表编进构建**：`CONFIG_PARTITION_TABLE_CUSTOM` + 绝对路径
+  `CUSTOM_FILENAME` 指向 `wol-rs/partitions.csv`（相对路径会被解析到 cargo
+  OUT_DIR，此即此前记录的"esp-idf-sys 已知限制"的真实原因）；
+  `CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y`。espflash 烧录不再需要
+  `--partition-table` 参数。
+- **新增 `sim` feature（Wokwi 模拟）**：`wifi_prov` 跳过 BLE 配网管理器，
+  直接 STA 连接模拟 AP `Wokwi-GUEST`；配网相关常量/函数随 feature 编译隔离。
+- **修复全新 flash 首启死循环**（Wokwi 模拟发现）：全新擦除的 NVS 上
+  `EspNvs::new(..., readwrite=false)` 返回 `ESP_ERR_NVS_NOT_FOUND`，
+  `config_store::init`/`mac_store::init` 原样上抛导致 `abort()` 重启循环；
+  现按"无存储配置，用默认值"处理。
+
 ## 目录
 
 ```
 wol-rs/
-├── Cargo.toml              # 模板骨架 + esp-idf-sys extra_components（network_provisioning/mqtt）+ serde
+├── Cargo.toml              # 模板骨架 + esp-idf-sys extra_components（network_provisioning/mqtt）+ sim feature
 ├── build.rs                # 模板自带：embuild::espidf::sysenv::output()
 ├── rust-toolchain.toml     # 模板自带：channel = "esp"
 ├── bindings.h              # bindgen 入口头文件（network_provisioning + chip_info/flash）
-├── .cargo/config.toml      # 模板自带：target/ldproxy/ESP_IDF_VERSION=v6.1/global
-├── sdkconfig.defaults      # 模板栈大小 + NimBLE + protocomm security 1
+├── partitions.csv          # 自定义分区表（编进构建；仓库根的 ../partitions.csv 仅为历史副本）
+├── wokwi.toml              # Wokwi 入口（elf + build/flasher_args.json）
+├── diagram.json            # Wokwi 场景：S3 板 + GPIO48 LED + 串口终端
+├── mkwokwi.sh              # 组装 Wokwi build/（bootloader + 分区表 + elf2image 固件镜像）
+├── .cargo/config.toml      # target/ldproxy/ESP_IDF_VERSION=v6.1
+├── sdkconfig.defaults      # 栈大小 + NimBLE + protocomm security 1 + 自定义分区表 + 4MB flash
 └── src/
     ├── main.rs             # 编排入口（对应 app_main.c）
     ├── app_config.rs       # 编译期常量（app_config.h）
@@ -175,7 +224,7 @@ wol-rs/
     ├── time_sync.rs        # SNTP（EspSntp 高层封装 + 时区 setenv）
     ├── watchdog.rs         # TWDT（esp_task_wdt FFI）
     ├── led_status.rs       # GPIO48 + 独立线程（PinDriver，Condvar 事件驱动）
-    ├── wifi_prov.rs        # BLE 配网（network_provisioning FFI，P3 已验证）
+    ├── wifi_prov.rs        # BLE 配网（network_provisioning FFI；sim feature 直连 Wokwi-GUEST）
     ├── index.html          # 内嵌单页 Web UI（原 components/wol_http/index.html）
     ├── control_http.rs     # EspHttpServer（index.html include_str 内嵌）
     └── control_mqtt.rs     # EspMqttClient::new + 事件循环线程（阻塞 connection.next()）
