@@ -107,7 +107,7 @@
 . "$HOME/.cargo/env"       # cargo / rustup
 
 # 构建（首次会完整编译 ESP-IDF，10~20 分钟；后续增量很快）
-cd wol-rs
+cd D:/WakeManager   # 项目根
 cargo build
 
 # 烧录 + 串口监视（自定义分区表已编进构建，无需额外参数）
@@ -121,45 +121,49 @@ wokwi-cli --expect-text "WakeManager ready" --fail-text "Guru Meditation" --time
 cargo clean
 ```
 
-生成物：`wol-rs/target/xtensa-esp32s3-espidf/debug/wol-rs`。
+生成物：`target/xtensa-esp32s3-espidf/debug/wol-rs`。
 
 ## 项目结构
 
+项目根即 cargo 工程根（`D:\WakeManager`）：
+
 ```
 WakeManager/
-├── partitions.csv              # 历史副本（权威：wol-rs/partitions.csv）
-├── README.md / CLAUDE.md
-└── wol-rs/                     # Rust 固件工程（cargo）
-    ├── Cargo.toml              # 依赖 + esp-idf-sys extra_components（mqtt / network_provisioning）+ sim feature
-    ├── build.rs                # embuild::espidf::sysenv::output()
-    ├── bindings.h              # bindgen 入口（network_provisioning + chip/flash info）
-    ├── rust-toolchain.toml     # channel = "esp"
-    ├── sdkconfig.defaults      # 主任务栈大小 + NimBLE + protocomm security 1 + 日志时间戳
-    ├── .cargo/config.toml      # target / ldproxy / ESP_IDF_VERSION=v6.1 / 复用全局工具链
-    └── src/
-        ├── main.rs             # 编排入口（对应原 app_main.c）
-        ├── index.html          # 内嵌单页 Web UI（include_str!）
-        ├── app_config.rs       # 编译期常量（原 app_config.h）
-        ├── config_store.rs     # NVS 配置（blob 260B）
-        ├── mac_store.rs        # NVS 地址簿（blob 341B）
-        ├── device_info.rs      # MAC / 设备 id
-        ├── netinfo.rs          # IP / 掩码 / SSID / RSSI / 空闲堆
-        ├── status.rs           # 状态/配置/地址簿的 serde 视图（JSON 构造）
-        ├── wol.rs              # 魔术包（std UdpSocket）+ 子网广播推导
-        ├── chip_temp.rs        # 片内温度（temperature_sensor FFI）
-        ├── time_sync.rs        # SNTP（EspSntp 高层封装 + 时区 setenv）
-        ├── watchdog.rs         # TWDT（esp_task_wdt FFI）
-        ├── led_status.rs       # GPIO48 + 独立线程（PinDriver，Condvar 事件驱动）
-        ├── wifi_prov.rs        # BLE 配网（network_provisioning FFI）
-        ├── control_http.rs     # EspHttpServer（专属线程持有）+ 内嵌 index.html
-        └── control_mqtt.rs     # EspMqttClient + 事件循环线程
+├── Cargo.toml                  # 依赖 + esp-idf-sys extra_components（mqtt / network_provisioning）+ sim feature
+├── build.rs                    # embuild::espidf::sysenv::output()
+├── bindings.h                  # bindgen 入口（network_provisioning + chip/flash info）
+├── rust-toolchain.toml         # channel = "esp"
+├── sdkconfig.defaults          # 栈大小 + NimBLE + protocomm security 1 + 自定义分区表（绝对路径）+ 4MB flash
+├── partitions.csv              # 自定义分区表（factory 3MB，编进构建）
+├── wokwi.toml / diagram.json   # Wokwi 模拟入口与场景
+├── mkwokwi.sh                  # 组装 Wokwi build/（bootloader + 分区表 + elf2image 固件镜像）
+├── .cargo/config.toml          # target / ldproxy / ESP_IDF_VERSION=v6.1（本机配置，不入库）
+├── target/                     # 构建产物（NTFS junction → D:\espbuild，见「开发经验」）
+├── build/                      # Wokwi 模拟镜像（mkwokwi.sh 生成，gitignored）
+└── src/
+    ├── main.rs                 # 编排入口（对应原 app_main.c）
+    ├── index.html              # 内嵌单页 Web UI（include_str!）
+    ├── app_config.rs           # 编译期常量（原 app_config.h）
+    ├── config_store.rs         # NVS 配置（blob 260B）
+    ├── mac_store.rs            # NVS 地址簿（blob 341B）
+    ├── device_info.rs          # MAC / 设备 id
+    ├── netinfo.rs              # IP / 掩码 / SSID / RSSI / 空闲堆
+    ├── status.rs               # 状态/配置/地址簿的 serde 视图（JSON 构造）
+    ├── wol.rs                  # 魔术包（std UdpSocket）+ 子网广播推导
+    ├── chip_temp.rs            # 片内温度（temperature_sensor FFI）
+    ├── time_sync.rs            # SNTP（EspSntp 高层封装 + 时区 setenv）
+    ├── watchdog.rs             # TWDT（esp_task_wdt FFI）
+    ├── led_status.rs           # GPIO48 + 独立线程（PinDriver，Condvar 事件驱动）
+    ├── wifi_prov.rs            # BLE 配网（network_provisioning FFI；sim 直连 Wokwi-GUEST）
+    ├── control_http.rs         # EspHttpServer（专属线程持有）+ 内嵌 index.html
+    └── control_mqtt.rs         # EspMqttClient + 事件循环线程 + API 工作线程
 ```
 
 托管组件（由 `Cargo.toml` 的 `extra_components` 声明）：`espressif/mqtt`、`espressif/network_provisioning`（后者还依赖 `espressif/json_generator`）。
 
 ## 配置（config_store）
 
-运行时配置以单个 blob 存于 NVS 命名空间 `wm_cfg`（key `cfg`），字段定义见 `wol-rs/src/config_store.rs` 的 `WmConfig`；编译期默认值在 `wol-rs/src/app_config.rs`。blob 布局与原 C 版 `wm_config_t` **逐字节兼容（260 字节）**。
+运行时配置以单个 blob 存于 NVS 命名空间 `wm_cfg`（key `cfg`），字段定义见 `src/config_store.rs` 的 `WmConfig`；编译期默认值在 `src/app_config.rs`。blob 布局与原 C 版 `wm_config_t` **逐字节兼容（260 字节）**。
 
 | 字段 | 说明 |
 | --- | --- |
@@ -173,7 +177,7 @@ WakeManager/
 
 ## MAC/IP 地址簿（mac_store）
 
-`wol-rs/src/mac_store.rs`：
+`src/mac_store.rs`：
 
 - 最多存 **10 组** MAC + IP，整体以单个 blob 存于 NVS 命名空间 `wm_mac`（key `list`），互斥锁保护。blob 布局与原 C 版 **逐字节兼容（341 字节）**。
 - MAC 统一规范化为 `AA:BB:CC:DD:EE:FF`；IP 可为空（唤醒时走自动推导的广播）。
@@ -220,26 +224,26 @@ WakeManager/
 
 **订阅四个主题**（主题全部固定，`<id>` = 设备 ID）：
 
-1. **广播主题**（共享，`WOL_MQTT_BROADCAST_TOPIC` = `wakemanager/broadcast`）
+1. **广播主题**（共享，`WOL_MQTT_BROADCAST_TOPIC` = `broadcast`）
    - 所有设备都订阅；远程在不知道任何设备 ID 时用它做**设备发现**。
    - 收到 `{"cmd":"status"}`（或缺省 `cmd`）→ 立即把自身状态（含 `id`）发布到状态主题。
    - **不接受唤醒命令**。
 
-2. **唤醒主题**（每设备，`WOL_MQTT_CMD_TOPIC` + `/<id>`，如 `wakemanager/cmd/A1B2C3D4E5F6`）
+2. **唤醒主题**（每设备，`WOL_MQTT_CMD_TOPIC` + `/<id>`，如 `cmd/A1B2C3D4E5F6`）
    - 唤醒命令：`{"cmd":"wake","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.255"}`
    - **`mac` 必传**；`ip` 可选，省略时优先用地址簿中该 MAC 存的 IP、否则用自动推导的广播地址。
 
-3. **地址簿设置主题**（每设备，`WOL_MQTT_MAC_TOPIC` + `/<id>`，如 `wakemanager/mac/A1B2C3D4E5F6`）
+3. **地址簿设置主题**（每设备，`WOL_MQTT_MAC_TOPIC` + `/<id>`，如 `mac/A1B2C3D4E5F6`）
    - 新增/更新：`{"cmd":"set","mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.5"}`（`add`/`update` 同义）
    - 删除：`{"cmd":"del","mac":"AA:BB:CC:DD:EE:FF"}`（`delete`/`remove` 同义）
    - 清空：`{"cmd":"clear"}`
    - 结果发布到状态主题（`ok: mac stored` / `error: address book full` 等）。
 
-4. **地址簿获取主题**（每设备，`WOL_MQTT_MAC_GET_TOPIC` + `/<id>`，如 `wakemanager/mac/get/A1B2C3D4E5F6`）
+4. **地址簿获取主题**（每设备，`WOL_MQTT_MAC_GET_TOPIC` + `/<id>`，如 `mac/get/A1B2C3D4E5F6`）
    - 收到 `{"cmd":"get"}`（或空消息）→ 把完整列表发布到状态主题。
    - 列表 JSON：`{"id":"A1B2C3D4E5F6","cmd":"mac_list","count":2,"macs":[{"mac":"AA:BB:...","ip":"192.168.1.5"},...]}`
 
-**发布：** 命令结果、发现应答、地址簿列表发布到 `WOL_MQTT_STATUS_TOPIC`（`wakemanager/status`）。芯片温度仅在按需发布的状态快照（`temp_c` 字段）中返回。
+**发布：** 命令结果、发现应答、地址簿列表发布到 `WOL_MQTT_STATUS_TOPIC`（`status`）。芯片温度仅在按需发布的状态快照（`temp_c` 字段）中返回。
 
 **指示灯：** `led_status` 在 MQTT **收发数据**时使 LED 快速闪烁约 **2 秒**，随后自动恢复到闪烁前由 `set()` 设定的状态（连接中慢闪 / 已连接常亮）。
 
@@ -248,16 +252,16 @@ WakeManager/
 ```
 1) 远程 publish  广播主题        {"cmd":"status"}
 2) 各设备 publish 状态主题        {... "id":"A1B2C3D4E5F6" ...}   ← 取得设备 ID
-3) 远程 publish  wakemanager/cmd/A1B2C3D4E5F6   {"cmd":"wake","mac":"..."}
-4) 远程 publish  wakemanager/mac/A1B2C3D4E5F6   {"cmd":"set","mac":"...","ip":"..."}
-5) 远程 publish  wakemanager/mac/get/A1B2C3D4E5F6  {"cmd":"get"}
+3) 远程 publish  cmd/A1B2C3D4E5F6   {"cmd":"wake","mac":"..."}
+4) 远程 publish  mac/A1B2C3D4E5F6   {"cmd":"set","mac":"...","ip":"..."}
+5) 远程 publish  mac/get/A1B2C3D4E5F6  {"cmd":"get"}
 ```
 
 **命令格式仅支持 JSON。**
 
 ## 代码规范
 
-- **一模块一文件**：每个功能放在 `wol-rs/src/<name>.rs`，模块顶部用 `//!` 写明对应原 C 组件。
+- **一模块一文件**：每个功能放在 `src/<name>.rs`，模块顶部用 `//!` 写明对应原 C 组件。
 - 日志统一用 `log` crate（`log::info!` / `warn!` / `error!`）；注意 `esp_idf_sys::*` glob 里也有 `log`，需要时写 `::log::info!`。
 - 错误处理：内部函数返回 `Result`，最外层 `main` 对致命错误 `std::process::abort()`（等价 C 的 `ESP_ERROR_CHECK`）。
 - 配置读写一律走 `config_store::get/save`；地址簿读写一律走 `mac_store::*`（内部加锁），不要直接读 NVS。
@@ -276,8 +280,8 @@ WakeManager/
 - **MQTT 数据不是 NUL 结尾**：`EventPayload::Received` 的 `topic`/`data` 需按长度/UTF-8 处理，避免越界。
 - **看门狗**：`watchdog::init()` 会 `reconfigure`（IDF 默认已 `CONFIG_ESP_TASK_WDT_INIT` 自动初始化）；等待配网期间不要提前把主任务加入看门狗，应在开始循环喂狗后再 `add_current_task()`。
 - **SNTP**：现在走 esp-idf-svc 的 `EspSntp`（server 字符串生命周期由句柄托管，`main()` 保活）；时区仍用 `setenv("TZ", ...)` + `tzset()`（0.53 的 `SntpConf` 无 timezone 字段）。
-- **分区表**：`wol-rs/partitions.csv`（factory 0x300000）通过 `CONFIG_PARTITION_TABLE_CUSTOM=y` 编进构建；esp-idf-sys 的限制是**相对路径被解析到 cargo OUT_DIR**，`CUSTOM_FILENAME` 必须写绝对路径（换机器需同步改 sdkconfig.defaults）。flash size 相应设为 4MB。
-- **Windows 构建目录**：esp-idf-sys 要求 canonicalize 后的 OUT_DIR ≤ 88 字符；`wol-rs/target` 是指向短路径（`D:\espbuild`）的 NTFS junction——产物在项目内可见、检查时解析回短路径。换机器需重建 junction（`New-Item -ItemType Junction`），不能用 subst（canonicalize 会还原成原长路径）。
+- **分区表**：`partitions.csv`（factory 0x300000）通过 `CONFIG_PARTITION_TABLE_CUSTOM=y` 编进构建；esp-idf-sys 的限制是**相对路径被解析到 cargo OUT_DIR**，`CUSTOM_FILENAME` 必须写绝对路径（换机器需同步改 sdkconfig.defaults）。flash size 相应设为 4MB。
+- **Windows 构建目录**：esp-idf-sys 要求 canonicalize 后的 OUT_DIR ≤ 88 字符；`target` 是指向短路径（`D:\espbuild`）的 NTFS junction——产物在项目内可见、检查时解析回短路径。换机器需重建 junction（`New-Item -ItemType Junction`），不能用 subst（canonicalize 会还原成原长路径）。
 - **NVS 全新 flash 首启**：只读 `EspNvs::new(..., false)` 在命名空间不存在时返回 `ESP_ERR_NVS_NOT_FOUND`，`config_store`/`mac_store` 的 `init` 必须按"无存储配置"处理而非上抛（此 bug 由 Wokwi 模拟发现——真机全擦后首启会 abort 重启循环）。
 - **Wokwi 模拟**：不支持 BLE → `sim` feature 跳过配网直连 `Wokwi-GUEST`；`wokwi.toml` 不要设 `gdbServerPort`（会暂停仿真等 GDB）；esp-idf-sys 的 CMake 产物 `libespidf.bin` 不含 Rust 代码，模拟镜像必须用 cargo elf 经 `esptool elf2image` 转换（`mkwokwi.sh`）。
 - **日志时间戳**：`CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y`，串口日志显示 `HH:MM:SS.sss`（本地时间）；SNTP 校时前为 epoch。

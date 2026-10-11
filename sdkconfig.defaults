@@ -28,6 +28,6 @@ CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y
 # `--partition-table ../partitions.csv`。
 CONFIG_PARTITION_TABLE_CUSTOM=y
 # 注：相对路径会被解析到 cargo 的 OUT_DIR（hash 目录）而失效，必须用绝对路径
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="D:/WakeManager/wol-rs/partitions.csv"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="D:/WakeManager/partitions.csv"
 # 表项合计 ~3.1MB（nvs+phy+factory），默认 2MB flash 装不下
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
