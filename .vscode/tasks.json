@@ -1,0 +1,38 @@
+{
+    // cargo 流程的任务快捷方式（本仓库通用，不含本机路径，可入库）
+    // Terminal → Run Task… 选择，或 Ctrl+Shift+B 跑默认「构建」任务。
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "构建 (cargo build)",
+            "type": "shell",
+            "command": "cargo build",
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": "$cargo"
+        },
+        {
+            "label": "烧录 + 监视 (cargo espflash)",
+            "type": "shell",
+            "command": "cargo espflash flash --monitor",
+            "group": "build",
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated" }
+        },
+        {
+            "label": "构建 sim + Wokwi 镜像 (mkwokwi)",
+            "type": "shell",
+            "command": "./wokwi/mkwokwi.sh",
+            "group": "build",
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated" }
+        },
+        {
+            "label": "组装真机镜像供插件 Flash (mkwokwi --real)",
+            "type": "shell",
+            "command": "./wokwi/mkwokwi.sh --real",
+            "group": "build",
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated" }
+        }
+    ]
+}

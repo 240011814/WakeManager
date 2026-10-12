@@ -94,9 +94,24 @@ cargo espflash flash --monitor                 # 自定义分区表已编进构�
 **rust-analyzer**（代码智能主体）、**ESP-IDF 扩展**（KConfig 高亮 / Monitor / 调试）、
 **Wokwi 扩展**（按 `**/wokwi.toml` 递归查找，直接读 `wokwi/wokwi.toml` 跑模拟）。
 
-- 构建/烧录/模拟都走 cargo（`cargo build`、`cargo espflash flash --monitor`、
-  `wokwi/mkwokwi.sh`），IDF 插件的 idf.py 构建 / menuconfig 按钮对 Rust 工程
-  不适用（无根 CMakeLists.txt，且 sdkconfig 权威文件是 `sdkconfig.defaults`）。
+- **构建 → 烧录 + 监视**就两步：`cargo build` 后跑
+  `cargo espflash flash --monitor`（或直接 `cargo run`，runner 已配好 =
+  构建 + 烧录 + 监视一体）。VS Code 里可用 `.vscode/tasks.json` 的
+  "构建 (cargo build)" / "烧录 + 监视 (cargo espflash)" 任务
+  （Ctrl+Shift+B 构建，Terminal → Run Task… 选烧录监视）。
+  注意同一时刻只能有一个进程占用串口——用插件 Monitor 就别同时在终端
+  跑 `espflash --monitor`，否则会报 `Resource busy` / 检测不到端口。
+- IDF 插件的 idf.py 构建 / menuconfig 按钮对 Rust 工程不适用（无根
+  CMakeLists.txt，且 sdkconfig 权威文件是 `sdkconfig.defaults`）。
+- **插件的 Flash / Monitor 按钮可用**（`.vscode/settings.json`，本机配置不入库）：
+  Flash 走 UART（`idf.flashType: UART`），并配了
+  `idf.preFlashTask: ./wokwi/mkwokwi.sh --real`——点 Flash 会**先自动
+  `cargo build`（真机 features）并把 flasher_args.json / project_description.json /
+  wol-rs.elf / wol-rs.bin 组装到根 `build/`**，再用 esptool 烧录；Monitor 读根
+  `sdkconfig` 软链取波特率、用 `build/project_description.json` 定位
+  `wol-rs.elf`（第一次点 Flash 或跑 `mkwokwi --real` 任务后即存在）。
+  端口写死为 `/dev/cu.usbmodem21401`（`tty.*` 在 macOS 上等 DCD、esptool 可能打不开；
+  换 USB 口后用命令面板 "ESP-IDF: Select port to use" 重选）。
 - **Monitor（串口监视）可用**：插件要求工作区根有 `sdkconfig`，这里放了一个
   **软链接指向 esp-idf-sys 的 `target/.../esp-idf-sys-*/out/sdkconfig`**（该文件
   是 cargo 构建生成的完整配置，`.gitignore` 已忽略）。esp-idf-sys 升级 / 换 target

@@ -1,0 +1,23 @@
+{
+  "clangd.path": "/Users/hyy/.espressif/tools/esp-clangd/esp-21.1.3_20260408/esp-clangd/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=/Users/hyy/project/WakeManager/build"
+  ],
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.customExtraVars": {},
+  "idf.currentSetup": "/Users/hyy/.espressif/v6.1/esp-idf",
+
+  // 烧录走 UART（esptool，消费 <build>/flasher_args.json）
+  "idf.flashType": "UART",
+  // 用 cu.* 设备（tty.* 在 macOS 上会等 DCD，esptool 可能打不开）
+  "idf.port": "/dev/cu.usbmodem21401",
+  // 插件 Flash 按钮：烧录前自动 cargo build（真机 features）+ 组装 build/，
+  // 使 flasher_args.json / project_description.json / wol-rs.elf 始终是最新固件
+  "idf.preFlashTask": "./wokwi/mkwokwi.sh --real",
+  // Rust 工程没有 CMake 的 .map，Size 任务无意义
+  "idf.enableSizeTaskAfterBuildTask": false
+}

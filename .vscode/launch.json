@@ -1,0 +1,27 @@
+{
+    // USB-JTAG 源码级调试（ESP32-S3，本机路径配置，按 .gitignore 不入库）
+    // 前置：cargo espflash flash 烧录 Rust 固件（或 wokwi 无关）；
+    // OpenOCD 由 runOpenOCD 自动拉起，配置取 .vscode/settings.json 的
+    // idf.openOcdConfigs（board/esp32s3-builtin.cfg，板载 USB-JTAG）。
+    // 注意：若手动开过 OpenOCD，先停掉旧实例，否则端口被占会启动失败。
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "wol-rs: USB-JTAG 调试（ESP32-S3）",
+            "type": "gdbtarget",
+            "request": "launch",
+            "gdb": "/Users/hyy/.espressif/tools/xtensa-esp-elf-gdb/17.1_20260402/xtensa-esp-elf-gdb/bin/xtensa-esp32s3-elf-gdb",
+            "program": "${workspaceFolder}/target/xtensa-esp32s3-espidf/debug/wol-rs",
+            "cwd": "${workspaceFolder}",
+            "runOpenOCD": true,
+            // Rust 工程没有 app_main：留空表示不设初始断点（否则会 thbreak app_main 失败）
+            "initialBreakpoint": "",
+            "target": {
+                "connectCommands": [
+                    "set remotetimeout 20",
+                    "target remote localhost:3333"
+                ]
+            }
+        }
+    ]
+}
