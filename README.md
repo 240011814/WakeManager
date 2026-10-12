@@ -92,17 +92,26 @@ cargo espflash flash --monitor                 # 自定义分区表已编进构�
 
 推荐扩展（打开仓库会自动提示安装，见 `.vscode/extensions.json`）：
 **rust-analyzer**（代码智能主体）、**ESP-IDF 扩展**（KConfig 高亮 / Monitor / 调试）、
-**Wokwi 扩展**（读取 `wokwi.toml` 直接跑模拟）。
+**Wokwi 扩展**（按 `**/wokwi.toml` 递归查找，直接读 `wokwi/wokwi.toml` 跑模拟）。
 
 - 构建/烧录/模拟都走 cargo（`cargo build`、`cargo espflash flash --monitor`、
-  `mkwokwi.sh`），IDF 插件的 idf.py 构建按钮对 Rust 工程不适用（无 CMakeLists）。
-- ESP-IDF 扩展首次使用需运行 setup 向导：IDF 路径 `D:\esptools\esp-idf\v6.1`、
-  tools 路径 `D:\esptools`。
+  `wokwi/mkwokwi.sh`），IDF 插件的 idf.py 构建 / menuconfig 按钮对 Rust 工程
+  不适用（无根 CMakeLists.txt，且 sdkconfig 权威文件是 `sdkconfig.defaults`）。
+- **Monitor（串口监视）可用**：插件要求工作区根有 `sdkconfig`，这里放了一个
+  **软链接指向 esp-idf-sys 的 `target/.../esp-idf-sys-*/out/sdkconfig`**（该文件
+  是 cargo 构建生成的完整配置，`.gitignore` 已忽略）。esp-idf-sys 升级 / 换 target
+  后 hash 目录变化、软链会悬空，重新执行：
+  `ln -sfn "$(ls -td target/xtensa-esp32s3-espidf/debug/build/esp-idf-sys-*/out/sdkconfig | head -1)" sdkconfig`
+- ESP-IDF 扩展的 IDF 环境用 EIM 安装（`~/.espressif/v6.1/esp-idf` + v6.1 venv，
+  由 `~/.espressif/tools/eim_idf.json` 提供），Windows 老机器的
+  `idf.*Win` / `idf.pythonInstallPath` 残留设置在 macOS 上无效但无害。
 - **USB-JTAG 源码级调试**：`cargo espflash flash` 烧录后，用调试面板的
-  "wol-rs: USB-JTAG 调试（ESP32-S3）"（`launch.json` 指向 Rust elf + esp-gdb +
-  OpenOCD，本机路径配置不入库；已通过 `idf_tools.py install
-  xtensa-esp-elf-gdb openocd-esp32` 装好）。注意 rust-analyzer 的 check 与
-  终端构建不要并发（会撞 CMake 构建锁）。
+  "wol-rs: USB-JTAG 调试（ESP32-S3）"（`.vscode/launch.json` 指向 Rust elf +
+  xtensa-esp32s3-elf-gdb，`runOpenOCD` 用 `.vscode/settings.json` 的
+  `idf.openOcdConfigs=board/esp32s3-builtin.cfg` 自动拉起 OpenOCD；本机路径配置
+  不入库）。**调试前先停掉残留 OpenOCD**（旧实例占着 3333 端口会让新会话失败：
+  `pkill -f openocd`，或看 `ps aux | grep openocd`）。注意 rust-analyzer 的
+  check 与终端构建不要并发（会撞 CMake 构建锁）。
 
 ## Wokwi 本地模拟
 
@@ -112,19 +121,22 @@ cargo espflash flash --monitor                 # 自定义分区表已编进构�
 
 ```bash
 export WOKWI_CLI_TOKEN=...                     # wokwi.com/dashboard/ci 免费获取
-cd /d/WakeManager   # 项目根
+cd <仓库根>
 cargo build --features sim                     # sim 固件（其余代码与真机一致）
-./mkwokwi.sh                                   # 组装 build/：bootloader + 自定义分区表 + 固件镜像
-wokwi-cli .                                    # 交互式串口 + 浏览器可视化
+./wokwi/mkwokwi.sh                             # 组装 wokwi/build/：bootloader + 自定义分区表 + 固件镜像
+wokwi-cli wokwi                                # 交互式串口 + 浏览器可视化
 # 自动 smoke test（串口断言）：
-wokwi-cli --expect-text "WakeManager ready" --fail-text "Guru Meditation" --timeout 90000 .
+wokwi-cli --expect-text "WakeManager ready" --fail-text "Guru Meditation" --timeout 90000 wokwi
 ```
 
-文件说明：`wokwi.toml`（elf + flasher_args 入口）、`diagram.json`
-（S3 板 + GPIO48 LED + 串口终端）、`mkwokwi.sh`（把 cargo 链接的固件 elf 经
+Wokwi 相关文件统一放在 `wokwi/` 子目录：`wokwi/wokwi.toml`（elf + flasher_args
+入口，路径相对本文件）、`wokwi/diagram.json`
+（S3 板 + GPIO48 LED + 串口终端）、`wokwi/mkwokwi.sh`（把 cargo 链接的固件 elf 经
 esptool `elf2image` 转成 app 镜像，连同 bootloader/分区表组装成
-`build/flasher_args.json` 可消费的布局；注意 esp-idf-sys CMake 产物
+`wokwi/build/flasher_args.json` 可消费的布局；注意 esp-idf-sys CMake 产物
 `libespidf.bin` 不含 Rust 代码，不能直接当固件用）。
+Wokwi for VS Code 扩展按 `**/wokwi.toml` 递归查找，子目录可直接识别；
+`wokwi/build/` 为生成物（gitignored）。
 
 ## FFI 绑定 network_provisioning 的机制
 
@@ -235,12 +247,13 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
 ├── rust-toolchain.toml     # 模板自带：channel = "esp"
 ├── bindings.h              # bindgen 入口头文件（network_provisioning + chip_info/flash）
 ├── partitions.csv          # 自定义分区表（factory 3MB，编进构建）
-├── wokwi.toml              # Wokwi 入口（elf + build/flasher_args.json）
-├── diagram.json            # Wokwi 场景：S3 板 + GPIO48 LED + 串口终端
-├── mkwokwi.sh              # 组装 Wokwi build/（bootloader + 分区表 + elf2image 固件镜像）
+├── wokwi/                  # Wokwi 模拟相关全部集中在此子目录
+│   ├── wokwi.toml          # Wokwi 入口（elf → ../target/... + build/flasher_args.json）
+│   ├── diagram.json        # Wokwi 场景：S3 板 + GPIO48 LED + 串口终端
+│   ├── mkwokwi.sh          # 组装 wokwi/build/（bootloader + 分区表 + elf2image 固件镜像）
+│   └── build/              # Wokwi 模拟镜像（mkwokwi.sh 生成，gitignored）
 ├── .cargo/config.toml      # target/ldproxy/ESP_IDF_VERSION=v6.1（本机配置，不入库）
 ├── sdkconfig.defaults      # 栈大小 + NimBLE + protocomm security 1 + 自定义分区表 + 4MB flash
-├── build/                  # Wokwi 模拟镜像（mkwokwi.sh 生成，gitignored）
 └── src/
     ├── main.rs             # 编排入口（对应 app_main.c）
     ├── app_config.rs       # 编译期常量（app_config.h）

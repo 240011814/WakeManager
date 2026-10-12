@@ -12,7 +12,7 @@ harness = false # do not use the built-in cargo test harness -> resolve rust-ana
 
 [features]
 # Wokwi 模拟构建：跳过 BLE 配网，直接 STA 连接模拟 AP Wokwi-GUEST。
-# 配合 wokwi.toml / diagram.json / mkwokwi.sh 使用（cargo build --features sim）。
+# 配合 wokwi/ 目录下的 wokwi.toml / diagram.json / mkwokwi.sh 使用（cargo build --features sim）。
 sim = []
 
 [profile.release]

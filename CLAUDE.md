@@ -114,8 +114,8 @@ cargo build
 cargo espflash flash --monitor
 
 # Wokwi 本地模拟（WOKWI_CLI_TOKEN 见 https://wokwi.com/dashboard/ci）
-cargo build --features sim && ./mkwokwi.sh
-wokwi-cli --expect-text "WakeManager ready" --fail-text "Guru Meditation" --timeout 90000 .
+cargo build --features sim && ./wokwi/mkwokwi.sh
+wokwi-cli --expect-text "WakeManager ready" --fail-text "Guru Meditation" --timeout 90000 wokwi
 
 # 清理
 cargo clean
@@ -135,11 +135,12 @@ WakeManager/
 ├── rust-toolchain.toml         # channel = "esp"
 ├── sdkconfig.defaults          # 栈大小 + NimBLE + protocomm security 1 + 自定义分区表（$ENV{PROJECT_DIR}）+ 4MB flash
 ├── partitions.csv              # 自定义分区表（factory 3MB，编进构建）
-├── wokwi.toml / diagram.json   # Wokwi 模拟入口与场景
-├── mkwokwi.sh                  # 组装 Wokwi build/（bootloader + 分区表 + elf2image 固件镜像）
+├── wokwi/                      # Wokwi 模拟相关统一放此子目录
+│   ├── wokwi.toml / diagram.json # 模拟入口与场景（elf → ../target/...，firmware → build/flasher_args.json）
+│   ├── mkwokwi.sh              # 组装 wokwi/build/（bootloader + 分区表 + elf2image 固件镜像）
+│   └── build/                  # 模拟镜像（mkwokwi.sh 生成，gitignored）
 ├── .cargo/config.toml          # target / ldproxy / ESP_IDF_VERSION=v6.1（本机配置，不入库）
 ├── target/                     # 构建产物（NTFS junction → D:\espbuild，见「开发经验」）
-├── build/                      # Wokwi 模拟镜像（mkwokwi.sh 生成，gitignored）
 └── src/
     ├── main.rs                 # 编排入口（对应原 app_main.c）
     ├── index.html              # 内嵌单页 Web UI（include_str!）
@@ -284,6 +285,7 @@ WakeManager/
   另注：esp-idf-sys 会把 `target/<triple>/<profile>/build/esp-idf-sys-*/out/sdkconfig` 作为**最后一个** defaults 文件传入（优先级最高），改 sdkconfig.defaults 时若该文件里已有旧值，需一并改掉或删除，否则不生效。
 - **Windows 构建目录**：esp-idf-sys 要求 canonicalize 后的 OUT_DIR ≤ 88 字符；`target` 是指向短路径（`D:\espbuild`）的 NTFS junction——产物在项目内可见、检查时解析回短路径。换机器需重建 junction（`New-Item -ItemType Junction`），不能用 subst（canonicalize 会还原成原长路径）。
 - **NVS 全新 flash 首启**：只读 `EspNvs::new(..., false)` 在命名空间不存在时返回 `ESP_ERR_NVS_NOT_FOUND`，`config_store`/`mac_store` 的 `init` 必须按"无存储配置"处理而非上抛（此 bug 由 Wokwi 模拟发现——真机全擦后首启会 abort 重启循环）。
-- **Wokwi 模拟**：不支持 BLE → `sim` feature 跳过配网直连 `Wokwi-GUEST`；`wokwi.toml` 不要设 `gdbServerPort`（会暂停仿真等 GDB）；esp-idf-sys 的 CMake 产物 `libespidf.bin` 不含 Rust 代码，模拟镜像必须用 cargo elf 经 `esptool elf2image` 转换（`mkwokwi.sh`）。
+- **Wokwi 模拟**：不支持 BLE → `sim` feature 跳过配网直连 `Wokwi-GUEST`；`wokwi/wokwi.toml` 不要设 `gdbServerPort`（会暂停仿真等 GDB）；esp-idf-sys 的 CMake 产物 `libespidf.bin` 不含 Rust 代码，模拟镜像必须用 cargo elf 经 `esptool elf2image` 转换（`wokwi/mkwokwi.sh`）；Wokwi 相关文件（`wokwi.toml`/`diagram.json`/`mkwokwi.sh`/产物 `build/`）统一在 `wokwi/` 子目录，Wokwi 扩展按 `**/wokwi.toml` 递归识别。
+- **ESP-IDF 插件（VS Code）**：idf.py Build/menuconfig 对 Rust 工程不适用（无根 CMakeLists.txt）；**Monitor 可用**——工作区根的 `sdkconfig` 是指向 `target/.../esp-idf-sys-*/out/sdkconfig` 的软链（esp-idf-sys 升级后悬空需重建，见 README 命令）；**调试**用 `.vscode/launch.json` 的 "wol-rs: USB-JTAG 调试（ESP32-S3）"（`gdbtarget` + `runOpenOCD`，本机配置不入库），调试前先 `pkill -f openocd` 清掉占 3333 端口的残留实例。
 - **日志时间戳**：`CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y`，串口日志显示 `HH:MM:SS.sss`（本地时间）；SNTP 校时前为 epoch。
 - **`unsafe` 边界**：FFI 调用集中在各模块，回调用 `unsafe extern "C" fn`；`EspHttpServer` 与 MQTT 客户端都由各自专属线程持有，避免跨线程移动非 `Send` 类型。
