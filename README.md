@@ -227,7 +227,7 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
 
 ## 目录
 
-项目根即 cargo 工程根（`D:\WakeManager`）：
+
 
 ```
 ├── Cargo.toml              # 模板骨架 + esp-idf-sys extra_components（network_provisioning/mqtt）+ sim feature

@@ -15,7 +15,6 @@ cd "$(dirname "$0")"
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"        # 默认 <crate>/target（见 .cargo/config.toml 的 junction 说明）
 PROFILE=debug
 ELF="$TARGET_DIR/xtensa-esp32s3-espidf/$PROFILE/wol-rs"
-IDF_PY="D:/esptools/python_env/idf6.1_py3.14_env/Scripts/python.exe"
 
 cargo build --features sim 2>&1 | tail -1
 
@@ -23,6 +22,22 @@ cargo build --features sim 2>&1 | tail -1
 SYS_BUILD=$(ls -td "$TARGET_DIR/xtensa-esp32s3-espidf/$PROFILE/build/esp-idf-sys-"*/out/build | head -1)
 [ -f "$ELF" ] || { echo "firmware elf not found: $ELF (run 'cargo build --features sim' first)" >&2; exit 1; }
 [ -f "$SYS_BUILD/bootloader/bootloader.bin" ] || { echo "esp-idf-sys build not found: $SYS_BUILD" >&2; exit 1; }
+
+# ESP-IDF venv 里的 python（跑 esptool elf2image）：不再硬编码路径（原先是
+# Windows 的 D:/...python.exe，换到 macOS 后失效）。路径从 esp-idf-sys 写的
+# out/esp-idf-build.json 里取 venv_python，跟随当前机器与 IDF 版本；
+# 可用环境变量 IDF_PY 覆盖。
+OUT_JSON="$(dirname "$SYS_BUILD")/esp-idf-build.json"
+if [ -z "${IDF_PY:-}" ] && [ -f "$OUT_JSON" ]; then
+    IDF_PY=$(OUT_JSON="$OUT_JSON" python3 -c \
+        'import json,os; print(json.load(open(os.environ["OUT_JSON"]))["venv_python"])' 2>/dev/null || true)
+fi
+if [ -n "${IDF_PY:-}" ] && [ -f "$IDF_PY" ]; then
+    ESPTOOL=("$IDF_PY" -m esptool)
+else
+    # 兜底：直接用 PATH 里的 python（需已安装 esptool）
+    ESPTOOL=(python3 -m esptool)
+fi
 
 rm -rf build
 mkdir -p build/bootloader build/partition_table
@@ -59,7 +74,7 @@ cat > build/flasher_args.json <<'EOF'
 EOF
 
 # 固件 elf → ESP app image（bootloader 只认 0xE9 头的镜像；objcopy 裸 bin 不行）
-"$IDF_PY" -m esptool --chip esp32s3 elf2image \
+"${ESPTOOL[@]}" --chip esp32s3 elf2image \
     --flash-mode dio --flash-freq 80m --flash-size 4MB \
     -o build/wol-rs.bin "$ELF"
 
