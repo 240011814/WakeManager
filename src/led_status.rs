@@ -93,7 +93,7 @@ fn led_task(mut pin: PinDriver<'static, Output>) {
 /// 对应 C 版 `led_status_init()`
 pub fn init() {
     // 本项目中 esp-idf-hal 外设句柄：LED 用 take()（gpio48），
-    // debug_uart 用 steal() 取无人占用的 uart1 + gpio45/46（TX/RX）；Wi-Fi 走裸 FFI 不占用
+    // debug_uart 用 steal() 取 uart1 + gpio43/44（U0TXD/U0RXD，经矩阵映射）；Wi-Fi 走裸 FFI 不占用
     let peripherals = Peripherals::take().expect("Peripherals::take (led is the only user)");
     let mut pin = PinDriver::output(peripherals.pins.gpio48)
         .expect("led gpio output config failed");

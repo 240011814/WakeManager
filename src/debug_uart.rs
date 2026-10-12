@@ -1,16 +1,15 @@
-//! GPIO45/46 调试/通信串口（UART1）：周期状态行 + 收发回环（echo）
+//! U0TXD/U0RXD（GPIO43/44）调试串口：收包 → 文本打印到控制台 log
 //!
-//! 引脚：GPIO45 = TX、GPIO46 = RX，115200 8N1 无流控（走 GPIO 矩阵，
-//! 与 UART0 控制台的 GPIO43/44 互不冲突）。外部 USB-TTL 接
-//! RX←GPIO45 + GND 即可收；把 TTL 的 TX 接 GPIO46 后，本模块会把收到的
-//! 字节原样回发（echo），用于验证链路。
+//! 引脚：GPIO43 = U0TXD（TX）、GPIO44 = U0RXD（RX），115200 8N1 无流控。
+//! 这两个脚就是板载 CH340K/USB 调试口的物理走线，所以从板载 USB 就能收。
+//! 本模块用 UART1 外设经 GPIO 矩阵映射到 43/44，收到的字节按 UTF-8（lossy）
+//! 转文本打到控制台 log（经 USB-Serial-JTAG 镜像到 /dev/cu.usbmodem*）。
 //!
-//! 注意：所有 log 仍走控制台（UART0 GPIO43/44 + USB-Serial-JTAG），
-//! 状态行同时写到这两个地方，方便对照。
+//! 注意：GPIO43/44 也是 UART0 控制台的默认脚；映射到 UART1 后，控制台在
+//! GPIO43 上的输出会被顶掉（log 仍会走 USB-Serial-JTAG 次级控制台）。
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use embedded_io::Write as _;
 use esp_idf_svc::hal::delay::TickType;
 use esp_idf_svc::hal::gpio::AnyIOPin;
 use esp_idf_svc::hal::peripherals::Peripherals;
@@ -19,44 +18,38 @@ use esp_idf_svc::hal::uart::{
     UartConfig, UartDriver,
 };
 use esp_idf_svc::hal::units::Hertz;
-use esp_idf_svc::sys::{esp_get_minimum_free_heap_size, esp_timer_get_time};
+use esp_idf_svc::sys::ESP_ERR_TIMEOUT;
 
-use crate::{chip_temp, control_mqtt, netinfo};
-
-// ESP32-S3 的 GPIO 矩阵最大 GPIO48（SOC_GPIO_PIN_COUNT=49），无 49/50。
-// GPIO45/46 是启动 strapping 脚（45=VDD_SPI 电压选择、46=ROM 打印控制），
-// 仅在上电采样时刻有要求，之后可正常作 UART 用；若你的模块带八线 PSRAM
-// 或板子把 46 接了特殊电路，换脚只改这两个常量。
-// TX/RX 接反时对调即可（设备 TX 应接 USB-TTL 的 RX）。
-const TX_GPIO: u8 = 45;
-const RX_GPIO: u8 = 46;
+// 直接使用 U0TXD/U0RXD（GPIO43/44）——板载 CH340K/USB 调试口的走线脚。
+// 注意：这两个脚同时是 UART0 控制台的默认脚，UART1 映射上来后会顶掉
+// GPIO43 上的控制台输出（log 仍走 USB-Serial-JTAG 次级控制台）。
+const TX_GPIO: u8 = 43;
+const RX_GPIO: u8 = 44;
 const BAUD: u32 = 115_200;
 
-/// UART1 收包轮询 / echo 间隔（既决定 echo 延迟，也是状态行的调度粒度）
-const ECHO_POLL_MS: u64 = 50;
-/// 周期状态行的间隔（秒）
-const STATUS_PERIOD_S: u64 = 10;
+/// 收包轮询间隔：read 带超时阻塞到这里长，既是收包调度粒度也是线程节拍
+const RX_POLL_MS: u64 = 50;
+/// 一次 read 的缓冲大小（满速 50ms 约可收 575 字节，超量由驱动 RX 环形缓冲暂存）
+const RX_BUF: usize = 512;
 
 /// 启动调试串口线程（独立线程，不阻塞主流程）
 pub fn start() {
     std::thread::Builder::new()
         .name("dbg_uart".into())
-        // 栈必须 ≥8192：reporter 每轮做 UartDriver::new（uart_driver_install）
-        // + sta_ssid_rssi（栈上 wifi_ap_record_t）+ chip_temp/format!。
-        // pthread 默认栈仅 4096（见 sdkconfig.defaults），会栈金丝雀整机复位。
+        // 栈必须 ≥8192（实测 pthread 默认 4096 会栈金丝雀整机复位）：
+        // UartDriver::new（uart_driver_install）+ format!/字符串分配都在本线程栈上。
         .stack_size(8192)
         .spawn(reporter)
         .expect("spawn debug uart reporter");
     ::log::info!(
-        "Debug UART started: UART1 TX=GPIO{TX_GPIO} RX=GPIO{RX_GPIO} {BAUD} 8N1, \
-         echo + one status line per {STATUS_PERIOD_S}s"
+        "Debug UART started: UART1 TX=GPIO{TX_GPIO} RX=GPIO{RX_GPIO} {BAUD} 8N1, rx → console log"
     );
 }
 
 fn reporter() {
-    // Peripherals::take() 已被 led_status::init() 消耗；uart1 与 TX/RX 引脚
-    // （gpio45/46）无人使用，这里 steal 出来本线程独占（驱动在本线程内创建
-    // 并持有到进程结束）
+    // Peripherals::take() 已被 led_status::init() 消耗；这里 steal 出 uart1 与
+    // TX/RX 引脚（gpio43/44）。GPIO43/44 虽被 UART0 控制台占用，但把 UART1
+    // 经 GPIO 矩阵映射上去即接管其物理走线（板载 CH340K/USB 调试口）。
     let peri = unsafe { Peripherals::steal() };
     let config = UartConfig::default()
         .baudrate(Hertz(BAUD))
@@ -66,7 +59,7 @@ fn reporter() {
     // AnyIOPin::steal：直接按引脚号取（0~48），TX_GPIO/RX_GPIO 换脚只改常量
     let tx = unsafe { AnyIOPin::steal(TX_GPIO) };
     let rx = unsafe { AnyIOPin::steal(RX_GPIO) };
-    let mut driver = match UartDriver::new(
+    match UartDriver::new(
         peri.uart1,
         tx,
         rx,
@@ -74,67 +67,30 @@ fn reporter() {
         None::<AnyIOPin>, // 无 RTS
         &config,
     ) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            ::log::error!(
-                "UART1 init failed (GPIO{TX_GPIO}/GPIO{RX_GPIO}): {e:?} — status lines will only go to console"
-            );
-            None
-        }
-    };
+        Ok(driver) => receive_loop(driver),
+        Err(e) => ::log::error!(
+            "UART1 init failed (GPIO{TX_GPIO}/GPIO{RX_GPIO}): {e:?} — rx log disabled"
+        ),
+    }
+}
 
-    let mut seq: u64 = 0;
-    let mut buf = [0u8; 128];
-    // 立即发第一条状态行，之后每 STATUS_PERIOD_S 秒一条
-    let mut next_status = Instant::now();
-
+fn receive_loop(driver: UartDriver<'static>) {
+    let mut buf = [0u8; RX_BUF];
     loop {
-        // ---- 收发回环：把 UART1 收到的字节原样回发（用 USB-TTL 验证链路）----
-        // read 带超时，既当收包轮询又保证状态行准点；ECHO_POLL_MS 决定 echo 延迟
-        if let Some(d) = driver.as_mut() {
-            if let Ok(n) = d.read(&mut buf, TickType::new_millis(ECHO_POLL_MS).ticks()) {
-                if n > 0 {
-                    let _ = d.write(&buf[..n]);
-                }
+        match driver.read(&mut buf, TickType::new_millis(RX_POLL_MS).ticks()) {
+            // hal 把“超时无数据”映射为 Err(Timeout)（uart.rs 文档），属正常空闲态
+            Err(e) if e.code() == ESP_ERR_TIMEOUT as i32 => {}
+            Ok(0) => {}
+            Ok(n) => {
+                // lossy：非法 UTF-8 序列替换为 U+FFFD，不会 panic
+                let text = String::from_utf8_lossy(&buf[..n]);
+                ::log::info!("uart1 rx ({n}B): {text}");
             }
-        } else {
-            // UART1 未起来：不轮询，按同一节拍睡，避免忙等
-            std::thread::sleep(Duration::from_millis(ECHO_POLL_MS));
-        }
-
-        // ---- 周期状态行：同时写 GPIO45（UART1 TX）与控制台日志 ----
-        if Instant::now() >= next_status {
-            next_status += Duration::from_secs(STATUS_PERIOD_S);
-            seq += 1;
-
-            // esp_timer_get_time 返回微秒（自启动起，含睡眠）
-            let up_s = (unsafe { esp_timer_get_time() } as u64) / 1_000_000;
-            let heap = netinfo::free_heap();
-            let min_heap = unsafe { esp_get_minimum_free_heap_size() };
-            let temp = match chip_temp::read() {
-                Ok(t) => format!("{t:.1}C"),
-                Err(_) => "n/a".to_string(),
-            };
-            let ip = netinfo::sta_ip();
-            let rssi = match netinfo::sta_ssid_rssi() {
-                Some((_, r)) => format!("{r}dBm"),
-                None => "n/a".to_string(),
-            };
-            let mqtt = if control_mqtt::is_connected() {
-                "up"
-            } else {
-                "down"
-            };
-
-            let line = format!(
-                "[UartTest #{seq}] up={up_s}s heap={heap} min={min_heap} temp={temp} ip={ip} rssi={rssi} mqtt={mqtt}\r\n"
-            );
-
-            if let Some(d) = driver.as_mut() {
-                let _ = d.write_all(line.as_bytes());
-                let _ = d.flush();
+            Err(e) => {
+                // 出错立即返回 → 必须 sleep，否则线程忙等烧满一个核
+                ::log::error!("UART1 read failed: {e:?}");
+                std::thread::sleep(Duration::from_millis(RX_POLL_MS));
             }
-            ::log::info!("{}", line.trim_end());
         }
     }
 }
