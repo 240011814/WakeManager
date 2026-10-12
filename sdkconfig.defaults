@@ -21,13 +21,6 @@ CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1=y
 # --- WakeManager: 日志时间戳：系统本地时间（SNTP 校时前显示 epoch）---
 CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y
 
-# --- WakeManager: 自定义分区表（crate 根的 partitions.csv，factory 3MB）---
-# 2026-10-11 实验验证：CONFIG_PARTITION_TABLE_CUSTOM* 在 esp-idf-sys 构建中
-# 可以正常工作（此前 README 记录的"已知限制"实为 CSV 路径问题——必须放在
-# crate 目录而非仓库根目录）。启用后 espflash 烧录不再需要
-# `--partition-table ../partitions.csv`。
 CONFIG_PARTITION_TABLE_CUSTOM=y
-# 注：相对路径会被解析到 cargo 的 OUT_DIR（hash 目录）而失效，必须用绝对路径
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="D:/WakeManager/partitions.csv"
-# 表项合计 ~3.1MB（nvs+phy+factory），默认 2MB flash 装不下
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="$ENV{PROJECT_DIR}/partitions.csv"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y

@@ -75,9 +75,12 @@ cargo espflash flash --monitor                 # 自定义分区表已编进构�
 > **分区表**：`partitions.csv`（仓库根）（factory 3MB）通过 sdkconfig.defaults 的
 > `CONFIG_PARTITION_TABLE_CUSTOM=y` + `CONFIG_PARTITION_TABLE_CUSTOM_FILENAME`
 > **编进了构建**。实测 esp-idf-sys 的限制在于**相对路径会被解析到 cargo 的
-> OUT_DIR**，`CUSTOM_FILENAME` 必须写绝对路径（当前 sdkconfig.defaults 已如此
-> 配置；换机器/路径时需同步修改）。仓库根的 `partitions.csv` 仅作历史参考，
-> 权威文件是 `partitions.csv`（仓库根）。
+> OUT_DIR**，`CUSTOM_FILENAME` 必须是绝对路径——当前 sdkconfig.defaults 写的是
+> CMake 的 `"$ENV{PROJECT_DIR}/partitions.csv"`（esp-idf-sys 构建时会把
+> `PROJECT_DIR` 环境变量设为 Cargo 工作区根目录，因此换机器/路径无需修改）。
+> 注意不要写 `${PROJECT_PATH}`：该 CMake 变量只在 `__project_info()` 作用域内
+> 存在，生成分区表路径时它是空的，会退化成 `/partitions.csv`。
+> 仓库根的 `partitions.csv` 仅作历史参考，权威文件是 `partitions.csv`（仓库根）。
 
 > **Windows 构建目录（本机环境要求）**：esp-idf-sys 在 Windows 上要求
 > canonicalize 后的 OUT_DIR ≤ 88 字符，因此 `target/` 实际是一个指向短路径
@@ -201,9 +204,10 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
 
 ## 优化记录（2026-10-11 第二批：模拟测试 + 修复）
 
-- **自定义分区表编进构建**：`CONFIG_PARTITION_TABLE_CUSTOM` + 绝对路径
-  `CUSTOM_FILENAME` 指向 `partitions.csv`（仓库根）（相对路径会被解析到 cargo
-  OUT_DIR，此即此前记录的"esp-idf-sys 已知限制"的真实原因）；
+- **自定义分区表编进构建**：`CONFIG_PARTITION_TABLE_CUSTOM` +
+  `CUSTOM_FILENAME="$ENV{PROJECT_DIR}/partitions.csv"` 指向 `partitions.csv`
+  （仓库根）（相对路径会被解析到 cargo OUT_DIR，此即此前记录的"esp-idf-sys
+  已知限制"的真实原因）；
   `CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y`。espflash 烧录不再需要
   `--partition-table` 参数。
 - **新增 `sim` feature（Wokwi 模拟）**：`wifi_prov` 跳过 BLE 配网管理器，
