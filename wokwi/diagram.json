@@ -8,7 +8,7 @@
             "id": "esp",
             "top": 0,
             "left": 0,
-            "attrs": { "flashSize": "4" }
+            "attrs": { "flashSize": "8" }
         },
         {
             "type": "wokwi-led",
@@ -28,6 +28,8 @@
     "connections": [
         [ "esp:TX", "$serialMonitor:RX", "", [] ],
         [ "esp:RX", "$serialMonitor:TX", "", [] ],
+        [ "esp:45", "$serialMonitor:RX", "", [] ],
+        [ "esp:46", "$serialMonitor:TX", "", [] ],
         [ "esp:3V3.1", "led1:A", "red", [] ],
         [ "led1:C", "r1:1", "black", [] ],
         [ "r1:2", "esp:48", "green", [] ]

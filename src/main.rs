@@ -127,6 +127,8 @@ fn main() {
         ::log::warn!("Internal temperature sensor unavailable (continuing)");
     }
 
+    debug_uart::start();
+
     // ---- Wi-Fi 与配网（已配网则直接 STA 连接）----
     wifi_prov::start();
 
@@ -160,9 +162,6 @@ fn main() {
     }
 
     ::log::info!("WakeManager ready");
-
-    // ---- GPIO45/46（UART1）每分钟一条调试状态行，用于串口测试 ----
-    debug_uart::start();
 
     // ---- 主任务空转，定期喂狗；工作在 HTTP/MQTT 回调与 LED 线程里 ----
     loop {

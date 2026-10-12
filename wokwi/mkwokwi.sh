@@ -88,11 +88,11 @@ cp "$SYS_BUILD/partition_table/partition-table.bin" "$OUT_DIR/partition_table/"
 cat > "$OUT_DIR/flasher_args.json" <<'EOF'
 {
     "write_flash_args" : [ "--flash-mode", "dio",
-                           "--flash-size", "4MB",
+                           "--flash-size", "8MB",
                            "--flash-freq", "80m" ],
     "flash_settings" : {
         "flash_mode": "dio",
-        "flash_size": "4MB",
+        "flash_size": "8MB",
         "flash_freq": "80m"
     },
     "flash_files" : {
@@ -114,7 +114,7 @@ EOF
 
 # 固件 elf → ESP app image（bootloader 只认 0xE9 头的镜像；objcopy 裸 bin 不行）
 "${ESPTOOL[@]}" --chip esp32s3 elf2image \
-    --flash-mode dio --flash-freq 80m --flash-size 4MB \
+    --flash-mode dio --flash-freq 80m --flash-size 8MB \
     -o "$OUT_DIR/wol-rs.bin" "$ELF"
 
 # ESP-IDF 插件（VS Code）的 Monitor/Size 按钮要求 <build>/project_description.json，

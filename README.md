@@ -235,7 +235,7 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
   `CUSTOM_FILENAME="$ENV{PROJECT_DIR}/partitions.csv"` 指向 `partitions.csv`
   （仓库根）（相对路径会被解析到 cargo OUT_DIR，此即此前记录的"esp-idf-sys
   已知限制"的真实原因）；
-  `CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y`。espflash 烧录不再需要
+  `CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y`。espflash 烧录不再需要
   `--partition-table` 参数。
 - **新增 `sim` feature（Wokwi 模拟）**：`wifi_prov` 跳过 BLE 配网管理器，
   直接 STA 连接模拟 AP `Wokwi-GUEST`；配网相关常量/函数随 feature 编译隔离。
@@ -268,7 +268,7 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
 │   ├── mkwokwi.sh          # 组装 wokwi/build/（bootloader + 分区表 + elf2image 固件镜像）
 │   └── build/              # Wokwi 模拟镜像（mkwokwi.sh 生成，gitignored）
 ├── .cargo/config.toml      # target/ldproxy/ESP_IDF_VERSION=v6.1（本机配置，不入库）
-├── sdkconfig.defaults      # 栈大小 + NimBLE + protocomm security 1 + 自定义分区表 + 4MB flash
+├── sdkconfig.defaults      # 栈大小 + NimBLE + protocomm security 1 + 自定义分区表 + 8MB flash
 └── src/
     ├── main.rs             # 编排入口（对应 app_main.c）
     ├── app_config.rs       # 编译期常量（app_config.h）
