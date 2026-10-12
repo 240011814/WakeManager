@@ -15,12 +15,19 @@ use esp_idf_sys::*;
 use crate::app_config as ac;
 use crate::led_status;
 
-/// IP_EVENT_STA_GOT_IP 置位；`wait_connected()` 在条件变量上等待（无轮询）
+/// IP_EVENT_STA_GOT_IP 置位、WIFI_EVENT_STA_DISCONNECTED 复位；
+/// `wait_connected()` 在条件变量上等待（无轮询）。复位保证将来复用
+/// `wait_connected()` 等待"断线恢复"时不会因陈旧的 true 直接返回。
 static CONNECTED: Mutex<bool> = Mutex::new(false);
 static CONNECTED_CV: Condvar = Condvar::new();
 
 fn signal_connected() {
     *CONNECTED.lock().unwrap() = true;
+    CONNECTED_CV.notify_all();
+}
+
+fn signal_disconnected() {
+    *CONNECTED.lock().unwrap() = false;
     CONNECTED_CV.notify_all();
 }
 
@@ -109,11 +116,37 @@ unsafe extern "C" fn event_handler(
                 ::log::info!("Provisioning successful");
             }
             network_prov_cb_event_t_NETWORK_PROV_END => {
-                // 配网服务停止 → 释放管理器
+                // 配网服务停止 → 释放管理器。
+                //
+                // 关键：配网管理器 deinit 时会注销它自己注册的 WIFI_EVENT 重连
+                // 处理（manager.c: esp_event_handler_unregister(WIFI_EVENT, …)）。
+                // 首次配网成功的路径此前没有任何重连 handler 接管，设备一旦断线
+                // 就再也不会自动重连（只能重启）。因此这里在 deinit 前查询配网
+                // 状态，若已配网则安装我们自己的重连 handler 接管。
+                // （不放到 start() 无条件注册：配网期间管理器靠"认证失败即放弃"
+                // 结束流程，我们的 handler 会在 auth fail 后无限重试与之打架。）
                 ::log::info!("Provisioning ended");
+                let mut provisioned = false;
+                let err = network_prov_mgr_is_wifi_provisioned(&mut provisioned);
+                if err != ESP_OK {
+                    ::log::error!("Failed to query provisioning state: {err:#x}");
+                }
                 let err = network_prov_mgr_deinit();
                 if err != ESP_OK {
                     ::log::error!("Failed to de-initialize provisioning manager: {err:#x}");
+                }
+                if provisioned {
+                    let err = esp_event_handler_register(
+                        WIFI_EVENT,
+                        ESP_EVENT_ANY_ID,
+                        Some(event_handler),
+                        ptr::null_mut(),
+                    );
+                    if err == ESP_OK {
+                        ::log::info!("Wi-Fi auto-reconnect handler installed (post-provisioning)");
+                    } else {
+                        ::log::error!("Failed to install Wi-Fi reconnect handler: {err:#x}");
+                    }
                 }
             }
             _ => {}
@@ -125,6 +158,7 @@ unsafe extern "C" fn event_handler(
             }
             x if x == wifi_event_t_WIFI_EVENT_STA_DISCONNECTED as i32 => {
                 ::log::info!("Disconnected, reconnecting...");
+                signal_disconnected();
                 led_status::set(led_status::Status::Connecting);
                 esp_wifi_connect();
             }

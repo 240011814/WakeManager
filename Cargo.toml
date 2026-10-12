@@ -32,8 +32,10 @@ log = "0.4"
 # embassy-time 依赖一并移除（全项目无 embassy 调用点）。
 esp-idf-svc = { version = "0.53", features = ["critical-section"] }
 esp-idf-sys = "0.38"
+# UartDriver 的写入 trait（debug_uart.rs 使用；版本与 esp-idf-hal 0.47 一致）
+embedded-io = "0.7"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = "1.0.154"
 
 [build-dependencies]
 embuild = "0.33.5"

@@ -10,6 +10,7 @@ mod chip_temp;
 mod config_store;
 mod control_http;
 mod control_mqtt;
+mod debug_uart;
 mod device_info;
 mod led_status;
 mod mac_store;
@@ -159,6 +160,9 @@ fn main() {
     }
 
     ::log::info!("WakeManager ready");
+
+    // ---- GPIO45/46（UART1）每分钟一条调试状态行，用于串口测试 ----
+    debug_uart::start();
 
     // ---- 主任务空转，定期喂狗；工作在 HTTP/MQTT 回调与 LED 线程里 ----
     loop {
