@@ -155,6 +155,7 @@ WakeManager/
     ├── time_sync.rs            # SNTP（EspSntp 高层封装 + 时区 setenv）
     ├── watchdog.rs             # TWDT（esp_task_wdt FFI）
     ├── led_status.rs           # GPIO48 + 独立线程（PinDriver，Condvar 事件驱动）
+    ├── touch.rs                # GPIO1 = 触摸通道 T1（touch_pad FFI，轮询 + 基线校准）
     ├── debug_uart.rs           # UART1 → GPIO43/44 命令口（收字节按 CR/LF 拼行）
     ├── serial_cmd.rs           # 串口命令分发（help / status / wifi-clear）
     ├── wifi_prov.rs            # BLE 配网（network_provisioning FFI；sim 直连 Wokwi-GUEST）

@@ -18,6 +18,7 @@ mod netinfo;
 mod serial_cmd;
 mod status;
 mod time_sync;
+mod touch;
 mod watchdog;
 mod wifi_prov;
 mod wol;
@@ -95,6 +96,9 @@ fn main() {
     // ---- 状态指示：先慢闪，Wi-Fi 连上后常亮 ----
     led_status::init();
     led_status::set(led_status::Status::Connecting);
+
+    // ---- GPIO1 原生电容触摸：触摸时 LED 闪一下并打印日志 ----
+    touch::start();
 
     // ---- NVS（Wi-Fi、配网与 config/mac store 都依赖它）
     // take() 内部完成 nvs_flash_init + 必要时 erase 重试（等价 C 版逻辑）

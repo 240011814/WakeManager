@@ -19,6 +19,10 @@ const LED_BLINK_MS: u64 = 500; // half period of the "connecting" blink
 
 const ACTIVITY_BLINK_MS: u64 = 100;
 const ACTIVITY_DURATION_MS: u64 = 2000;
+
+/// 触摸反馈闪烁：100 ms 半周期，共 600 ms（“闪一下”）
+const TOUCH_BLINK_MS: u64 = 100;
+const TOUCH_DURATION_MS: u64 = 600;
 /// 已连接常亮态的重估周期：电平不变，仅兜底重读状态
 const STEADY_RECHECK_MS: u64 = 1000;
 /* ----------------------------------------------------------------------- */
@@ -33,6 +37,8 @@ pub enum Status {
 static STATUS: AtomicU8 = AtomicU8::new(0);
 /// MQTT 活动闪烁截止时刻（None = 无活动）
 static ACTIVITY_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+/// 触摸反馈闪烁截止时刻（None = 无触摸反馈）
+static TOUCH_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 /// 唤醒信号：set()/activity() 置位并通知 LED 线程立即重估相位
 static WAKE: Mutex<bool> = Mutex::new(false);
 static WAKE_CV: Condvar = Condvar::new();
@@ -60,8 +66,20 @@ fn led_task(mut pin: PinDriver<'static, Output>) {
             }
             act.is_some()
         };
+        let touch = {
+            let mut t = TOUCH_UNTIL.lock().unwrap();
+            if matches!(*t, Some(until) if Instant::now() >= until) {
+                *t = None;
+            }
+            t.is_some()
+        };
 
-        let wait_ms = if activity {
+        let wait_ms = if touch {
+            // 触摸反馈：最高优先级的短促快闪，窗口结束后自动回到常规状态
+            on = !on;
+            set_level(&mut pin, on);
+            TOUCH_BLINK_MS
+        } else if activity {
             // MQTT 流量活动：快速闪烁，窗口结束后自动回到常规状态
             on = !on;
             set_level(&mut pin, on);
@@ -118,5 +136,12 @@ pub fn set(status: Status) {
 pub fn activity() {
     *ACTIVITY_UNTIL.lock().unwrap() =
         Some(Instant::now() + Duration::from_millis(ACTIVITY_DURATION_MS));
+    wake();
+}
+
+/// 触摸反馈：600 ms 快闪一下（触摸检测线程调用）
+pub fn touch_flash() {
+    *TOUCH_UNTIL.lock().unwrap() =
+        Some(Instant::now() + Duration::from_millis(TOUCH_DURATION_MS));
     wake();
 }
