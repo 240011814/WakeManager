@@ -130,7 +130,7 @@ cargo clean
 ```
 WakeManager/
 ├── Cargo.toml                  # 依赖 + esp-idf-sys extra_components（mqtt / network_provisioning）+ sim feature
-├── build.rs                    # embuild::espidf::sysenv::output()
+├── build.rs                    # embuild::espidf::sysenv::output() + 生成 clangd 编译数据库
 ├── bindings.h                  # bindgen 入口（network_provisioning + chip/flash info）
 ├── rust-toolchain.toml         # channel = "esp"
 ├── sdkconfig.defaults          # 栈大小 + NimBLE + protocomm security 1 + 自定义分区表（$ENV{PROJECT_DIR}）+ 8MB flash
@@ -294,5 +294,6 @@ WakeManager/
 - **Wokwi 模拟**：不支持 BLE → `sim` feature 跳过配网直连 `Wokwi-GUEST`；`wokwi/wokwi.toml` 不要设 `gdbServerPort`（会暂停仿真等 GDB）；esp-idf-sys 的 CMake 产物 `libespidf.bin` 不含 Rust 代码，模拟镜像必须用 cargo elf 经 `esptool elf2image` 转换（`wokwi/mkwokwi.sh`）；Wokwi 相关文件（`wokwi.toml`/`diagram.json`/`mkwokwi.sh`/产物 `build/`）统一在 `wokwi/` 子目录，Wokwi 扩展按 `**/wokwi.toml` 递归识别。
 - **烧录 + 监视的正确姿势**：`cargo build` → `cargo espflash flash --monitor`（或 `cargo run`，runner 已配好）；**插件按钮也已打通**——`.vscode/settings.json` 配了 `idf.preFlashTask: ./wokwi/mkwokwi.sh --real`，点插件 Flash 会自动 cargo build（真机）+ 组装根 `build/`（`flasher_args.json`/`project_description.json`/`wol-rs.elf`/`wol-rs.bin`）再烧录，Monitor 用其中的 `project_description.json` 定位 elf、用根 sdkconfig 软链读波特率。`wokwi/build/` 是 sim 镜像，别拿去烧真机。**串口同时只能一个进程打开**：残留的 espflash/monitor 会话会让插件烧录、端口检测报 `Resource busy` / `Failed to detect the default serial port`（先 `lsof /dev/cu.usbmodem*` 排查）。
 - **ESP-IDF 插件（VS Code）**：idf.py Build/menuconfig 对 Rust 工程不适用（无根 CMakeLists.txt）；**Monitor 可用**——工作区根的 `sdkconfig` 是指向 `target/.../esp-idf-sys-*/out/sdkconfig` 的软链（esp-idf-sys 升级后悬空需重建，见 README 命令）；**调试**用 `.vscode/launch.json` 的 "wol-rs: USB-JTAG 调试（ESP32-S3）"（`gdbtarget` + `runOpenOCD`，本机配置不入库），**`request` 必须是 `attach`**——`launch` 模式适配器会自己 spawn `gdbserver` 当被调试端（ESP32 没这个程序 → `spawn gdbserver ENOENT`），attach 才是连 OpenOCD 的 3333 端口、由 `runOpenOCD` 自动拉起 OpenOCD；调试前先 `pkill -f openocd` 清掉占 3333 端口的残留实例。
+- **clangd 编译数据库**：`bindings.h` 里的 ESP-IDF 头文件（`esp_chip_info.h` 等）include 路径来自 esp-idf-sys 的 CMake 构建，clangd 无从得知 → 编辑器报 `'esp_chip_info.h' file not found`（**不是构建错误**，`cargo build` 不受影响）。`build.rs` 每次构建从最新 `esp-idf-sys-*/out/build/compile_commands.json` 提取全部 `-I`/`-D`（含托管组件），用真实编译命令探测工具链隐式目录（**必须用真实命令**：裸跑 `gcc -E -Wp,-v` 拿不到 picolibc 目录，`stdio.h` 会链断在 `__FILE`），补上两个托管组件守卫宏，为 `bindings.h` 合成一条条目写到 `target/clangd-db/compile_commands.json`（`.vscode/settings.json` 的 `--compile-commands-dir` 指向它）。不能放仓库根 `build/`——`mkwokwi.sh --real` 每次 `rm -rf` 它。`cargo clean` 后重新 `cargo build` 即恢复；VS Code 里 clangd 报旧缓存时执行 "clangd: Restart language server"。
 - **日志时间戳**：`CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y`，串口日志显示 `HH:MM:SS.sss`（本地时间）；SNTP 校时前为 epoch。
 - **`unsafe` 边界**：FFI 调用集中在各模块，回调用 `unsafe extern "C" fn`；`EspHttpServer` 与 MQTT 客户端都由各自专属线程持有，避免跨线程移动非 `Send` 类型。

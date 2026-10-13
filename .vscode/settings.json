@@ -3,7 +3,8 @@
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=/Users/hyy/project/WakeManager/build"
+    // 编译数据库由 build.rs 从 esp-idf-sys 的 CMake 产物提取生成（cargo build 时刷新）
+    "--compile-commands-dir=/Users/hyy/project/WakeManager/target/clangd-db"
   ],
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"

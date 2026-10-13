@@ -39,6 +39,9 @@ serde_json = "1.0.154"
 
 [build-dependencies]
 embuild = "0.33.5"
+# build.rs 从 esp-idf-sys 的 compile_commands.json 提取 include 路径，
+# 为 clangd 生成 bindings.h 的编译数据库
+serde_json = "1"
 
 # ---------------------------------------------------------------------------
 # esp-idf-sys 构建配置（根 crate 的 metadata，由 build.rs / embuild 消费）
