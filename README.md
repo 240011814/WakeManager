@@ -26,6 +26,8 @@ LED/看门狗/SNTP/温度），BLE 配网沿用已验证的 FFI 方案。内嵌 
 | `app_main.c` | `src/main.rs` | 编排入口 |
 | （status 快照辅助） | `src/status.rs` | 状态/配置/地址簿的 `serde` 视图（JSON） |
 | （netif/wifi 查询） | `src/netinfo.rs` | netif/wifi FFI |
+| （新增，无 C 对应） | `src/debug_uart.rs` | UART1 → GPIO43/44 命令口（收字节拼行） |
+| （新增，无 C 对应） | `src/serial_cmd.rs` | 串口命令分发（help / status / wifi-clear） |
 
 JSON 构造统一用 `serde_json`（替代 C 的手写 sb_add / cJSON）。
 
@@ -87,6 +89,49 @@ cargo espflash flash --monitor                 # 自定义分区表已编进构�
 > （如 `D:\espbuild`）的 **NTFS 目录联接**——产物在项目路径下可见可用，
 > 路径检查时又解析回短位置。换机器重建：
 > `powershell "New-Item -ItemType Junction -Path D:\WakeManager\target -Target D:\espbuild"`。
+
+## 串口命令（板载 USB 调试口）
+
+板载 USB（立创 ESP32S3R8N8 的 Type-C）下行引出两个口，命令走其中的 **CH340K**：
+
+- **命令口**：`/dev/cu.wchusbserial*`（macOS 用 `cu.*`；`tty.*` 要等 DCD，打不开）
+  —— 115200 8N1，GPIO43(TX)/GPIO44(RX)，`debug_uart.rs` 收字节按 CR/LF 拼行 →
+  `serial_cmd.rs` 分发，响应回写同一串口。
+- **控制台 log 口**：`/dev/cu.usbmodem*`（原生 USB-Serial-JTAG 次级控制台镜像），
+  `cargo espflash flash --monitor` 看这里；收到的命令原文也以 debug 级别打到这。
+
+命令以 CR/LF 或 LF 结尾（上限 256 字节，超长丢弃并提示一次）；空行忽略，
+未知命令提示后返回菜单：
+
+| 命令 | 别名 | 作用 |
+| --- | --- | --- |
+| `help` | `cmd` / `menu` / `?` | 返回命令菜单 |
+| `status` | `st` | 设备状态文本（与 `/api/status` 同一份数据）：id/ip/ssid/rssi/heap/mqtt/broadcast/macs/temp/time |
+| `wifi-clear` | `reset-wifi` | 清除 NVS 里的 Wi-Fi 配置（SSID/密码）→ 回复确认 → 300ms 后重启 → 开机检测到未配网，自动重新进入 BLE 配网（App 扫日志里的 QR / PoP）。**破坏性操作，设备需重新配网才能联网** |
+
+示例（在串口终端里发 `help` / `status`）：
+
+```
+> help
+==== WakeManager 串口命令 ====
+help         显示本菜单
+status       查看设备状态
+wifi-clear   清除 Wi-Fi 配置并重新进入配网模式（设备将重启）
+
+> status
+id=441BF681C1F4
+ip=172.16.9.57
+ssid=Wiseman
+rssi=-60 dBm
+...
+```
+
+`wifi-clear` 的实现路径：配网管理器判定"已配网"只看 STA 配置 SSID 是否非空
+（network_provisioning `manager.c` 的 `network_prov_mgr_is_wifi_provisioned`），
+清配置就是 `esp_wifi_restore()`。所以命令走"清 NVS + 重启"复用**开机配网路径**，
+不在运行时重新拉起配网管理器（此时 mgr 已 deinit、BLE 内存已释放，重启最干净）。
+
+加新命令：`serial_cmd.rs` 的 `handle()` match 加分支 + `MENU` 加一行即可。
 
 ## VS Code
 
@@ -195,7 +240,7 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
       mac set/del/clear 全分支（含 `error: address book full`/`mac not found`/`invalid MAC`/
       `unsupported command` 等 C 版文案）、mac_get 列表、无效 JSON 报错
 - [x] **看门狗**：30s TWDT + panic，长时间运行无重启
-- [ ] BLE 重新配网（需手机 ESP Provisioning App：先擦除 NVS 命名空间 `wifi.prov`）
+- [ ] BLE 重新配网（用串口命令 `wifi-clear` 或擦除 NVS：清掉 Wi-Fi 配置后重启即进配网模式，手机 ESP Provisioning App 扫日志里的 QR / 输 PoP）
 
 > 注：`partitions.csv` 的 factory 分区从 0x180000 扩到 0x300000（Rust 镜像 1.8MB 超过
 > 1.5MB）。
@@ -282,6 +327,8 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
     ├── time_sync.rs        # SNTP（EspSntp 高层封装 + 时区 setenv）
     ├── watchdog.rs         # TWDT（esp_task_wdt FFI）
     ├── led_status.rs       # GPIO48 + 独立线程（PinDriver，Condvar 事件驱动）
+    ├── debug_uart.rs       # UART1 → GPIO43/44 命令口（拼行，见「串口命令」）
+    ├── serial_cmd.rs       # 串口命令分发（help / status / wifi-clear）
     ├── wifi_prov.rs        # BLE 配网（network_provisioning FFI；sim feature 直连 Wokwi-GUEST）
     ├── index.html          # 内嵌单页 Web UI（原 components/wol_http/index.html）
     ├── control_http.rs     # EspHttpServer（index.html include_str 内嵌）

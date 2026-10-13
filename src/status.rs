@@ -33,7 +33,8 @@ pub struct DeviceStatus {
     pub time: Option<String>,
 }
 
-fn device_status() -> DeviceStatus {
+/// 设备状态快照；HTTP `/api/status`、MQTT 状态发布与串口 `status` 命令共用。
+pub fn device_status() -> DeviceStatus {
     let (ssid, rssi) = netinfo::sta_ssid_rssi().unwrap_or_default();
     DeviceStatus {
         id: device_info::get_id(),

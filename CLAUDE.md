@@ -155,6 +155,8 @@ WakeManager/
     ├── time_sync.rs            # SNTP（EspSntp 高层封装 + 时区 setenv）
     ├── watchdog.rs             # TWDT（esp_task_wdt FFI）
     ├── led_status.rs           # GPIO48 + 独立线程（PinDriver，Condvar 事件驱动）
+    ├── debug_uart.rs           # UART1 → GPIO43/44 命令口（收字节按 CR/LF 拼行）
+    ├── serial_cmd.rs           # 串口命令分发（help / status / wifi-clear）
     ├── wifi_prov.rs            # BLE 配网（network_provisioning FFI；sim 直连 Wokwi-GUEST）
     ├── control_http.rs         # EspHttpServer（专属线程持有）+ 内嵌 index.html
     └── control_mqtt.rs         # EspMqttClient + 事件循环线程 + API 工作线程
@@ -274,7 +276,9 @@ WakeManager/
 - **ffi / 宏不可见**：`TEMPERATURE_SENSOR_CONFIG_DEFAULT()`、`NETWORK_PROV_EVENT_HANDLER_*` 等含复合字面量的宏 bindgen 不可见，需手工构造结构体（见 `wifi_prov.rs` / `chip_temp.rs`）。`WIFI_INIT_CONFIG_DEFAULT()` 同样不可见，但其字段值**全部取自 esp-idf-sys 生成的 `WIFI_*` / `CONFIG_*` 常量**（与 esp-idf-svc 内部一致），改 menuconfig 会自动跟随，无需手工同步。
 - **bindgen 命名**：枚举常量名通常去掉了类型 `_t` 后缀（如 `network_prov_security_NETWORK_PROV_SECURITY_1`）；`ssize_t` 绑定为 `isize`。以 `_t_` 开头的 bindgen 常量在 `match` 中触发 `non_upper_case_globals` 警告，可在函数上加 `#[allow(non_upper_case_globals)]`。
 - **Wi-Fi 重连的接管时机**：`wifi_prov.rs` 的重连 handler（STA_DISCONNECTED → `esp_wifi_connect()`）只在「已配网直连」与 sim 分支注册；**首次 BLE 配网成功的路径**要在 `NETWORK_PROV_END` 回调里、`network_prov_mgr_deinit()` 之前查询 `is_wifi_provisioned` 并按需注册——管理器 deinit 会注销它自己的 WIFI_EVENT handler，没人接管的话断线后永不重连。不能在 `start()` 无条件注册：配网期间管理器靠"认证失败即放弃"收尾，我们的 handler 会在 auth fail 后无限重试与之打架。
-- **板载 USB 的两个口（立创 ESP32S3R8N8：CH334F HUB + CH340K）**：① **CH340K ← UART0/GPIO43/44**——上面调试串口映射到这组脚后，echo/状态行就从这个口出去（macOS 需 WCH 驱动，枚举为 `wchusbserial*`）；② **ESP32 原生 USB（GPIO19/20）= USB-Serial-JTAG**，即 `/dev/cu.usbmodem*`，次级控制台把 log 镜像到这里。两个下行口引到同一个 Type-C。
+- **板载 USB 的两个口（立创 ESP32S3R8N8：CH334F HUB + CH340K）**：① **CH340K ← UART0/GPIO43/44**——上面调试串口映射到这组脚后，**串口命令口（help/status/wifi-clear 菜单）**就从这个口进出（macOS 需 WCH 驱动，枚举为 `wchusbserial*`，用 `cu.*` 打开）；② **ESP32 原生 USB（GPIO19/20）= USB-Serial-JTAG**，即 `/dev/cu.usbmodem*`，次级控制台把 log 镜像到这里。两个下行口引到同一个 Type-C。
+- **串口命令口的实现要点**（`debug_uart.rs` transport + `serial_cmd.rs` 命令层，两层分离）：esp-idf-hal `UartDriver::read` 把"超时无数据"映射为 `Err(ESP_ERR_TIMEOUT)`，**这是正常空闲态不是错误**（真错误才 sleep 兜底，否则读失败立即返回会让线程忙等烧满一核）；行缓冲上限 256 字节，超长进入丢弃态到换行才提示一次（逐字节提示会刷屏）；响应用 `embedded-io` 的 `write_all` + `flush`（= 等 TX 排空），该依赖因此**必须保留**（其它模块将来发串口也靠它）。加命令 = `handle()` 的 match 加分支 + `MENU` 加一行。
+- **wifi-clear 的机制依据**：network_provisioning `manager.c:1352` 的 `network_prov_mgr_is_wifi_provisioned` 只看 STA 配置 SSID 是否非空；`network_prov_mgr_reset_wifi_provisioning`（`manager.c:2445`）内部就是 `esp_wifi_restore()`。所以"清 Wi-Fi 密码 + 重新配网" = `esp_wifi_restore()` 清 NVS → `esp_restart()` → 开机 `wifi_prov::start()` 检测到未配网自动进 BLE 配网。**不要**尝试运行时重新拉起配网：此时 mgr 已 `deinit`、配网结束时 BT/BLE 内存已释放（`network_prov_event_handler_free_btdm`），重启是最干净的路径。
 - **MQTT 生命周期**：`control_mqtt.rs` 用 `EspMqttClient::new` 得到 `(client, connection)`：connection 交给专属事件线程用阻塞的 `connection.next()` 驱动事件循环；client 交由**专属 API 工作线程（`mqtt_api`）独占**，事件线程与 HTTP 线程只通过 `API_TX` 队列投递 SubscribeAll/Publish 操作。`stop()` 先关队列 → 工作线程退出并 drop client → 事件通道关闭 → join 两个线程。状态主题统一取自 `app_config`。**事件线程栈必须 ≥8192**：事件处理含 serde_json 与大 FFI 栈结构（`wifi_ap_record_t` 约 800B），4KB 会触发栈金丝雀整机遇测复位（表象为发现命令无应答）。**client id 每设备唯一**（`wakemanager-<设备id>`），固定 ID 会被 broker 互踢导致发现时好时坏。
 - **MQTT API 锁死锁（espressif/mqtt 1.1.0，2026-10-11 Wokwi 模拟发现）**：mqtt 任务循环在 API 锁内分发事件（`MQTT_API_LOCK → run_event_loop → dispatch → svc 回调 share() 阻塞等事件线程处理完，锁全程不放`）。因此**事件处理路径上（含 Connected 分支）调用任何 client API（subscribe/publish）都会互相等待死锁**——表象为连接成功但订阅/上线日志缺失、设备在平台上看不到。修复：所有 client API 走 `mqtt_api` 工作线程。诱因是 `Cargo.toml` 的 `espressif/mqtt version = "1.*"` 浮动版本在重建时拉到 1.1.0（事件循环新架构）；旧组件（10-10 真机验证时的解析结果）无此问题。
 - **Wokwi 模拟网络限制**：不支持 BLE（`sim` feature 跳过配网）；出站 TCP/DNS/UDP(NTP) 正常，但长连接约 25s 被 NAT 断开（`MQTT error: ESP_FAIL → Disconnected → 自动重连`循环），真机不受影响。
