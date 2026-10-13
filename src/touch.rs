@@ -11,13 +11,19 @@
 //!
 //! 工作方式（legacy `driver/touch_pad.h`，polling 版）：
 //!   1. `touch_pad_init` → 定时器 FSM 模式 → 逐通道 `touch_pad_config` → `touch_pad_fsm_start`
-//!   2. 启动时采样约 1 s 校准各通道“未触摸”基线（取最大值）
+//!   2. 基线校准用**滑动窗口中位数**：窗口内极差 ≤ 25%（稳定未触摸）才接受；
+//!      开机时手指若还按着（例如刚用长按触发过重启），窗口会一直不稳定 → 持续等待，
+//!      手指离开后自动完成；极端干扰下 10 s 后强行接受并告警
 //!   3. 后台线程 50 ms 轮询原始计数。注意：**ESP32-S3（触摸硬件 v2）触摸时计数上升**
 //!      （硬件触发条件 = raw − benchmark ≥ 阈值，见 touch_sensor_ll.h；与老 ESP32 v1 的
 //!      “触摸下降”相反），超过基线 × 1.5 判定为触摸（回落到 × 1.2 以下才释放，带迟滞防抖）
+//!   4. 运行期基线自愈：未按下时读数持续 1 s 低于基线 × 0.9（开机校准被触摸污染等
+//!      异常场景）→ 自动把基线重校准到当前读数；未按下且读数明显偏高时基线慢速向上漂移
+//!      （吸收环境/温度漂移，速度慢到不会被一次触摸带偏）
 //!
 //! GPIO 走触摸外设的模拟通道，不占用 `Peripherals::take()`（与 debug_uart/LED 无关）。
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use esp_idf_svc::sys::*;
@@ -28,8 +34,17 @@ use crate::led_status;
 const POLL_MS: u64 = 50;
 /// 校准前丢弃的样本数，等待测量稳定
 const WARMUP_SAMPLES: u32 = 5;
-/// 校准样本数（含 warmup，约 0.5~1 s）
-const CALIB_SAMPLES: u32 = 25;
+/// 校准滑动窗口：warmup 后取 2 s 窗口样本的中位数作为基线
+const CALIB_WINDOW: usize = 40;
+/// 校准窗口上限：窗口极差一直超限（有触摸/干扰）时，最多再等 ~8 s 后强行接受
+const CALIB_MAX: usize = 200;
+/// 校准接受条件：窗口内 (max-min) ≤ max × 25% 视为“稳定的未触摸状态”
+const CALIB_SPREAD: f64 = 0.25;
+/// 运行期自愈：未按下时连续 1 s 读数低于基线 × 0.9 → 基线重校准到当前读数
+const RECAL_SUSTAIN_SAMPLES: u32 = 20;
+/// 未按下时基线向上慢漂的吸收分母：仅当 raw - baseline ≥ 1200 时才吸收
+/// （约 1/1200 per poll，τ≈60 s；一次几秒的触摸几乎带不动它）
+const DRIFT_DIVISOR: u32 = 1200;
 /// 触发阈值：原始计数 > 基线 ×（1 + 0.5），S3 触摸时计数上升（实测触摸为基线的 6~15 倍）
 const TOUCH_RISE_RATIO: f64 = 0.5;
 /// 释放阈值：原始计数回落到 基线 ×（1 + 0.2） 以下（迟滞，防抖）
@@ -48,6 +63,16 @@ struct Chan {
     gpio: u32,
     /// `Some(ms)` = 长按通道；`None` = 轻触通道
     long_press_ms: Option<u64>,
+    /// 是否仍在基线校准阶段
+    calibrating: bool,
+    /// 校准阶段剩余丢弃样本数
+    warmup: u32,
+    /// 校准滑动窗口
+    samples: VecDeque<u32>,
+    /// 校准等待超过 5 s 的提示已发过
+    calib_warned: bool,
+    /// 运行期：连续低于基线×0.9 的样本计数（基线自愈）
+    low_count: u32,
     baseline: u32,
     touch_th: u32,
     release_th: u32,
@@ -69,6 +94,11 @@ impl Chan {
             pad,
             gpio,
             long_press_ms,
+            calibrating: true,
+            warmup: WARMUP_SAMPLES,
+            samples: VecDeque::with_capacity(CALIB_MAX),
+            calib_warned: false,
+            low_count: 0,
             baseline: 0,
             touch_th: 0,
             release_th: 0,
@@ -80,7 +110,7 @@ impl Chan {
         }
     }
 
-    /// 校准完成后计算触发/释放阈值
+    /// 基线变化后重算触发/释放阈值
     fn finish_calibration(&mut self) {
         self.touch_th = (self.baseline as f64 * (1.0 + TOUCH_RISE_RATIO)) as u32;
         self.release_th = (self.baseline as f64 * (1.0 + RELEASE_RISE_RATIO)) as u32;
@@ -147,39 +177,64 @@ fn read_raw(pad: touch_pad_t) -> Option<u32> {
     }
 }
 
-fn touch_task(mut chans: Vec<Chan>) {
-    // ---- 校准：采集未触摸状态下的基线（所有通道同一时间窗采样）----
-    for i in 0..CALIB_SAMPLES {
-        std::thread::sleep(Duration::from_millis(POLL_MS));
-        for ch in chans.iter_mut() {
-            let Some(raw) = read_raw(ch.pad) else {
-                if i == CALIB_SAMPLES - 1 {
-                    ::log::warn!("touch read failed during calibration on GPIO{}", ch.gpio);
-                }
-                continue;
-            };
-            if i >= WARMUP_SAMPLES {
-                ch.baseline = ch.baseline.max(raw);
-            }
-        }
-    }
+/// 窗口中位数（拷贝排序取中间，窗口 ≤ 200 个样本）
+fn median(win: &VecDeque<u32>) -> u32 {
+    let mut v: Vec<u32> = win.iter().copied().collect();
+    v.sort_unstable();
+    v[v.len() / 2]
+}
 
-    for ch in &mut chans {
-        ch.finish_calibration();
-        if ch.baseline == 0 {
-            // 基线为 0 说明测量未运行，无法判定触摸；告警便于排查
-            ::log::warn!(
-                "Touch baseline is 0 on GPIO{} - no valid measurement (touch disabled)",
-                ch.gpio
+fn touch_task(mut chans: Vec<Chan>) {
+    // ---- 校准：滑动窗口取稳定“未触摸”中位数 ----
+    let calib_start = Instant::now();
+    while chans.iter().any(|c| c.calibrating) {
+        std::thread::sleep(Duration::from_millis(POLL_MS));
+        let waited = calib_start.elapsed();
+
+        for ch in chans.iter_mut().filter(|c| c.calibrating) {
+            let Some(raw) = read_raw(ch.pad) else { continue };
+            if ch.warmup > 0 {
+                ch.warmup -= 1;
+                continue;
+            }
+            ch.samples.push_back(raw);
+            if ch.samples.len() > CALIB_MAX {
+                ch.samples.pop_front();
+            }
+            if ch.samples.len() < CALIB_WINDOW {
+                continue;
+            }
+
+            let (min, max) = (
+                *ch.samples.iter().min().unwrap(),
+                *ch.samples.iter().max().unwrap(),
             );
-        } else {
-            ::log::info!(
-                "Touch baseline on GPIO{}: {} (touch > {}, release < {})",
-                ch.gpio,
-                ch.baseline,
-                ch.touch_th,
-                ch.release_th
-            );
+            let spread_ok = max > 0 && (max - min) as f64 <= max as f64 * CALIB_SPREAD;
+            if spread_ok || ch.samples.len() >= CALIB_MAX {
+                ch.baseline = median(&ch.samples);
+                ch.finish_calibration();
+                ch.calibrating = false;
+                if !spread_ok {
+                    ::log::warn!(
+                        "Touch baseline on GPIO{} accepted after timeout (unstable window min {min} max {max}) - interference or pad was touched?",
+                        ch.gpio
+                    );
+                }
+                ::log::info!(
+                    "Touch baseline on GPIO{}: {} (touch > {}, release < {})",
+                    ch.gpio,
+                    ch.baseline,
+                    ch.touch_th,
+                    ch.release_th
+                );
+            } else if !ch.calib_warned && waited >= Duration::from_secs(5) {
+                // 手指一直按着（如刚长按触发过重启）/干扰持续 → 继续等待并提示
+                ch.calib_warned = true;
+                ::log::warn!(
+                    "Waiting for touch baseline calibration on GPIO{} (window min {min} max {max}) - keep the pad untouched",
+                    ch.gpio
+                );
+            }
         }
     }
 
@@ -189,13 +244,15 @@ fn touch_task(mut chans: Vec<Chan>) {
         let now = Instant::now();
         for ch in chans.iter_mut() {
             let Some(raw) = read_raw(ch.pad) else { continue };
-           // ::log::info!("Touch value on GPIO{} (baseline {}, raw: {raw})", ch.gpio, ch.baseline);
+            ::log::info!("Touch value on GPIO{} (baseline {}, raw: {raw})", ch.gpio, ch.baseline);
 
             if !ch.pressed {
                 // 未按下：超过触发阈值则按下
-                if ch.baseline != 0 && raw > ch.touch_th {
+                if raw > ch.touch_th {
                     ch.pressed = true;
                     ch.count += 1;
+                    // 自愈计时清零（避免按下期间累积）
+                    ch.low_count = 0;
                     ::log::info!(
                         "Touch detected on GPIO{} (count: {}, raw: {raw}, baseline: {})",
                         ch.gpio,
@@ -215,6 +272,29 @@ fn touch_task(mut chans: Vec<Chan>) {
                                 ch.gpio,
                                 total / 1000
                             );
+                        }
+                    }
+                } else {
+                    // 基线自愈：持续低于基线×0.9（开机校准被触摸污染等异常）→ 重校准
+                    // （触摸只会抬高读数，"持续偏低"只可能是参考基线错了）
+                    if raw + raw / 10 < ch.baseline {
+                        ch.low_count += 1;
+                        if ch.low_count >= RECAL_SUSTAIN_SAMPLES {
+                            ::log::info!(
+                                "Touch baseline on GPIO{} recalibrated: {} -> {raw}",
+                                ch.gpio,
+                                ch.baseline
+                            );
+                            ch.baseline = raw;
+                            ch.finish_calibration();
+                            ch.low_count = 0;
+                        }
+                    } else {
+                        ch.low_count = 0;
+                        // 向上慢漂：吸收环境/温度导致的缓慢上移（分母大，一次触摸带不动）
+                        if raw > ch.baseline + DRIFT_DIVISOR {
+                            ch.baseline += (raw - ch.baseline) / DRIFT_DIVISOR;
+                            ch.finish_calibration();
                         }
                     }
                 }
