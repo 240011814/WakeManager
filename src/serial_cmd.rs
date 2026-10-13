@@ -54,9 +54,10 @@ fn status_text() -> String {
         .map(|t| format!("{t:.1} C"))
         .unwrap_or_else(|| "n/a".to_string());
     let time = s.time.unwrap_or_else(|| "未同步".to_string());
+    let boot = s.boot_time.unwrap_or_else(|| "n/a".to_string());
     format!(
         "id={}\r\nip={}\r\nssid={}\r\nrssi={}\r\nheap={} B\r\nmqtt={}\r\n\
-         broadcast={}\r\nmacs={}\r\ntemp={}\r\ntime={}",
+         broadcast={}\r\nmacs={}\r\ntemp={}\r\ntime={}\r\nboot={}",
         s.id,
         s.ip,
         if s.ssid.is_empty() { "n/a" } else { &s.ssid },
@@ -67,6 +68,7 @@ fn status_text() -> String {
         s.mac_count,
         temp,
         time,
+        boot,
     )
 }
 

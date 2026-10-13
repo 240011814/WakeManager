@@ -31,6 +31,9 @@ pub struct DeviceStatus {
     pub temp_c: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time: Option<String>,
+    /// 开机时刻（首次 SNTP 校时后才有值，格式同 time）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_time: Option<String>,
 }
 
 /// 设备状态快照；HTTP `/api/status`、MQTT 状态发布与串口 `status` 命令共用。
@@ -47,6 +50,7 @@ pub fn device_status() -> DeviceStatus {
         mac_count: mac_store::count(),
         temp_c: crate::chip_temp::read().ok(),
         time: time_sync::is_synced().then(time_sync::format_now),
+        boot_time: time_sync::boot_time(),
     }
 }
 

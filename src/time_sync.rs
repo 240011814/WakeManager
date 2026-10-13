@@ -7,6 +7,7 @@
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use esp_idf_svc::sntp::{EspSntp, SntpConf};
 use esp_idf_svc::sys::*;
@@ -14,13 +15,15 @@ use esp_idf_svc::sys::*;
 use crate::app_config as ac;
 
 static SYNCED: AtomicBool = AtomicBool::new(false);
+/// 开机时刻（Unix 秒；None = 尚未记录）。首次 SNTP 校时后由回调填充。
+/// xtensa 目标无 64 位原子操作 → 用 Mutex。
+static BOOT_TIME: Mutex<Option<i64>> = Mutex::new(None);
 
 /// localtime_r + 手工格式化（与 C 版 strftime("%Y-%m-%d %H:%M:%S") 一致）
-pub fn format_now() -> String {
+fn format_time(t: time_t) -> String {
     unsafe {
-        let now: time_t = time(std::ptr::null_mut());
         let mut tm: tm = std::mem::zeroed();
-        if localtime_r(&now, &mut tm).is_null() {
+        if localtime_r(&t, &mut tm).is_null() {
             return String::new();
         }
         format!(
@@ -33,6 +36,17 @@ pub fn format_now() -> String {
             tm.tm_sec
         )
     }
+}
+
+/// 当前（本地）时间
+pub fn format_now() -> String {
+    format_time(unsafe { time(std::ptr::null_mut()) })
+}
+
+/// 开机时间（本地时间）。首次 SNTP 校时前返回 None。
+/// 校时时刻 − 开机以来的运行时长（esp_timer_get_time），即真实上电/重启时刻。
+pub fn boot_time() -> Option<String> {
+    BOOT_TIME.lock().unwrap().map(|t| format_time(t as time_t))
 }
 
 /// 对应 C 版 `time_sync_start()`。
@@ -49,6 +63,14 @@ pub fn start() -> EspSntp<'static> {
     let mut conf = SntpConf::default();
     conf.servers[0] = ac::NTP_SERVER;
     let sntp = EspSntp::new_with_callback(&conf, |_delay| {
+        // 首次校时：用"同步时刻 − 运行时长"反推真实开机时刻（后续重校时不更新）
+        if BOOT_TIME.lock().unwrap().is_none() {
+            let synced_at = unsafe { time(std::ptr::null_mut()) };
+            let uptime_s = unsafe { esp_timer_get_time() } / 1_000_000;
+            let boot = synced_at - uptime_s;
+            *BOOT_TIME.lock().unwrap() = Some(boot);
+            ::log::info!("Boot time: {} (uptime {}s)", format_time(boot), uptime_s);
+        }
         SYNCED.store(true, Ordering::SeqCst);
         ::log::info!("Clock synchronised: {}", format_now());
     })
