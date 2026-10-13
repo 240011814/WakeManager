@@ -145,6 +145,7 @@ WakeManager/
     ├── main.rs                 # 编排入口（对应原 app_main.c）
     ├── index.html              # 内嵌单页 Web UI（include_str!）
     ├── app_config.rs           # 编译期常量（原 app_config.h）
+    ├── app_log.rs              # 自定义日志前端（EspLogger 不认 SYSTEM_FULL 时间戳 cfg）
     ├── config_store.rs         # NVS 配置（blob 260B）
     ├── mac_store.rs            # NVS 地址簿（blob 341B）
     ├── device_info.rs          # MAC / 设备 id

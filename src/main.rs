@@ -6,6 +6,7 @@
 //!   Wi-Fi/配网 → 等 IP → SNTP → 订阅看门狗 → HTTP/MQTT → 主循环喂狗
 
 mod app_config;
+mod app_log;
 mod chip_temp;
 mod config_store;
 mod control_http;
@@ -23,7 +24,6 @@ mod watchdog;
 mod wifi_prov;
 mod wol;
 
-use esp_idf_svc::log::EspLogger;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::*;
 
@@ -87,7 +87,8 @@ fn main() {
     // https://github.com/esp-rs/esp-idf-template/issues/71
     esp_idf_svc::sys::link_patches();
 
-    EspLogger::initialize_default();
+    // 自定义 logger：esp-idf-svc 的 EspLogger 不认 SYSTEM_FULL 时间戳 cfg（会输出空括号）
+    app_log::init();
     ::log::info!("WakeManager (Rust)");
 
     // ---- 芯片 / flash 基本信息 ----

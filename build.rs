@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 fn main() {
+    // 向 rustc 声明 esp-idf-sys 依据 sdkconfig 注入的 cfg（app_log.rs 用到），
+    // 否则触发 unexpected_cfgs 警告
+    println!("cargo:rustc-check-cfg=cfg(esp_idf_log_colors)");
     embuild::espidf::sysenv::output();
     emit_clangd_db();
 }
