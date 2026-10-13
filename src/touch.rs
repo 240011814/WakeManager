@@ -244,8 +244,7 @@ fn touch_task(mut chans: Vec<Chan>) {
         let now = Instant::now();
         for ch in chans.iter_mut() {
             let Some(raw) = read_raw(ch.pad) else { continue };
-            ::log::info!("Touch value on GPIO{} (baseline {}, raw: {raw})", ch.gpio, ch.baseline);
-
+    
             if !ch.pressed {
                 // 未按下：超过触发阈值则按下
                 if raw > ch.touch_th {
