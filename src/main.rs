@@ -97,7 +97,7 @@ fn main() {
     led_status::init();
     led_status::set(led_status::Status::Connecting);
 
-    // ---- GPIO1 原生电容触摸：触摸时 LED 闪一下并打印日志 ----
+    // ---- 触摸：GPIO1 轻触闪灯；GPIO7 长按 20s 清 Wi-Fi 进配网 ----
     touch::start();
 
     // ---- NVS（Wi-Fi、配网与 config/mac store 都依赖它）
