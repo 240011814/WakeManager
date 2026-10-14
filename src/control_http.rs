@@ -8,6 +8,8 @@
 //!   POST /api/config    -> 保存配置（x-www-form-urlencoded）+ 重启 MQTT
 //!   GET  /api/wake      -> 发送 magic packet（?mac= 必传，?ip= 可选）
 //!   GET  /api/mac       -> MAC/IP 地址簿
+//!   GET  /api/ota/check -> 触发 OTA 版本检查（异步，结果经 /api/status 轮询）
+//!   POST /api/ota       -> 触发 OTA 升级下载（异步，完成后自动重启）
 //!
 //! 服务器由专属线程创建并持有（线程内 `EspHttpServer` 不跨线程移动，
 //! 因此无需 `unsafe impl Send/Sync`）。
@@ -276,13 +278,27 @@ fn mac_get(request: Request<&mut EspHttpConnection<'_>>) -> Result<(), EspIOErro
     send_json(request, &status::mac_list_http_json())
 }
 
+fn ota_check_get(request: Request<&mut EspHttpConnection<'_>>) -> Result<(), EspIOError> {
+    match crate::ota::start_check() {
+        Ok(()) => send_json(request, r#"{"ok":true}"#),
+        Err(e) => send_err(request, 409, "Conflict", &e),
+    }
+}
+
+fn ota_post(request: Request<&mut EspHttpConnection<'_>>) -> Result<(), EspIOError> {
+    match crate::ota::start_upgrade() {
+        Ok(()) => send_json(request, r#"{"ok":true}"#),
+        Err(e) => send_err(request, 409, "Conflict", &e),
+    }
+}
+
 /* ---------------- server ---------------- */
 
 fn build_server() -> Result<EspHttpServer<'static>, EspError> {
     let config = Configuration {
         http_port: ac::WOL_HTTP_PORT,
         lru_purge_enable: true,
-        max_uri_handlers: 6,
+        max_uri_handlers: 8,
         ..Default::default()
     };
     let mut server = EspHttpServer::new(&config).map_err(|EspIOError(e)| e)?;
@@ -293,6 +309,8 @@ fn build_server() -> Result<EspHttpServer<'static>, EspError> {
     server.fn_handler("/api/config", Method::Post, config_post)?;
     server.fn_handler("/api/wake", Method::Get, wake_get)?;
     server.fn_handler("/api/mac", Method::Get, mac_get)?;
+    server.fn_handler("/api/ota/check", Method::Get, ota_check_get)?;
+    server.fn_handler("/api/ota", Method::Post, ota_post)?;
 
     Ok(server)
 }

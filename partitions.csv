@@ -1,5 +1,9 @@
-# Name,   Type, SubType, Offset,  Size, Flags
-# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
-nvs,      data, nvs,     ,      0x6000,
-phy_init, data, phy,     ,      0x1000,
-factory,  app,  factory, ,      0x300000,
+# Name,   Type, SubType, Offset,   Size,     Flags
+# OTA 双槽布局（8MB flash）：
+#   otadata 控制启动槽；app 首刷落在 ota_0，OTA 后 bootloader 切到 ota_1，交替。
+#   NVS 偏移与旧 factory 布局一致（0x9000），存量设备配置数据不受影响。
+nvs,      data, nvs,     0x9000,   0x6000,
+otadata,  data, ota,     0xf000,   0x2000,
+phy_init, data, phy,     0x11000,  0x1000,
+ota_0,    app,  ota_0,   0x20000,  0x3D0000,
+ota_1,    app,  ota_1,   0x3F0000, 0x3D0000,

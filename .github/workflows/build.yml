@@ -79,11 +79,12 @@ jobs:
       # 否则 rustup 报 "custom toolchain 'esp' ... is not installed"
       # espup 默认安装最新版 Xtensa 工具链并命名为 "esp"（与 rust-toolchain.toml
       # 的 channel 匹配）；--toolchain-version 只接受版本号（如 1.87.0.0），
-      # 不能传 "esp"。
+      # 不能传 "esp"。且 espup 会读取当前目录的 rust-toolchain.toml，把
+      # channel="esp" 当版本号解析而报错 → 必须在仓库目录之外执行。
       - name: 安装 Xtensa Rust 工具链 (espup) 与 ldproxy
         run: |
           RUSTUP_TOOLCHAIN=stable cargo install espup ldproxy --locked
-          RUSTUP_TOOLCHAIN=stable espup install --targets esp32s3
+          (cd "$HOME" && RUSTUP_TOOLCHAIN=stable espup install --targets esp32s3)
           # espup 未安装过时才会生成；缺失则兜底写一个
           [ -f "$HOME/export-esp.sh" ] || echo 'export LIBCLANG_PATH="$HOME/.espressif/llvm-xtensa/lib"' > "$HOME/export-esp.sh"
 
@@ -91,6 +92,13 @@ jobs:
         run: |
           . "$HOME/export-esp.sh"
           . "$HOME/.cargo/env"
+          # OTA 版本注入：tag 构建用 tag 名，分支构建用 git describe
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            export WOL_VERSION="$GITHUB_REF_NAME"
+          else
+            export WOL_VERSION="$(git describe --tags --always 2>/dev/null || echo "dev-${GITHUB_SHA::7}")"
+          fi
+          echo "WOL_VERSION=$WOL_VERSION"
           chmod +x wokwi/mkwokwi.sh
           ./wokwi/mkwokwi.sh --real --release
 
@@ -182,8 +190,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 打 tag 时把完整镜像 zip 上传到 prepare_release 创建的草稿 Release
-      # （--clobber 支持重跑覆盖；此时尚未公开）
+      # 打 tag 时把镜像 zip + 裸固件 wol-rs.bin + manifest.json 上传到草稿 Release
+      # （wol-rs.bin 是设备 OTA 的下载源，manifest.json 供工具消费；--clobber 支持重跑覆盖）
       - name: 上传产物到草稿 Release (tag only)
         if: startsWith(github.ref, 'refs/tags/')
         env:
@@ -195,11 +203,23 @@ jobs:
             echo "::error::No prepared release ID found for ${{ steps.prep.outputs.tag }}."
             exit 1
           fi
+          # manifest.json：版本 + 提交 + 各文件 sha256
+          (cd firmware-dist && sha256sum wol-rs.bin bootloader/bootloader.bin partition_table/partition-table.bin) > /tmp/sha.txt
+          cat > firmware-dist/manifest.json << EOF
+          {
+            "version": "${{ steps.prep.outputs.tag }}",
+            "commit": "${{ github.sha }}",
+            "chip": "esp32s3",
+            "sha256": {$(awk '{printf "    \"%s\": \"%s\",\n", $2, $1}' /tmp/sha.txt | sed '$ s/,$//')}
+          }
+          EOF
           cd firmware-dist
           zip -r "../wol-rs-${{ steps.prep.outputs.tag }}.zip" .
           cd ..
           gh release upload "${{ steps.prep.outputs.tag }}" \
             "wol-rs-${{ steps.prep.outputs.tag }}.zip" \
+            firmware-dist/wol-rs.bin \
+            firmware-dist/manifest.json \
             --clobber
 
       - name: 上传 Actions 构件（备份）

@@ -65,6 +65,20 @@
   </div>
 
   <div class="card">
+    <h2>固件升级 (OTA)</h2>
+    <div class="grid">
+      <div class="k">当前版本</div><div id="ota_cur">-</div>
+      <div class="k">最新版本</div><div id="ota_latest">-</div>
+      <div class="k">状态</div><div id="ota_state">-</div>
+    </div>
+    <div class="row">
+      <button id="otaCheckBtn" onclick="otaCheck()">检查更新</button>
+      <button id="otaUpBtn" onclick="otaUpgrade()" style="display:none">立即升级</button>
+    </div>
+    <div class="msg" id="otaMsg"></div>
+  </div>
+
+  <div class="card">
     <h2>MAC 地址簿</h2>
     <div class="grid" id="macList"><div class="k">-</div><div>暂无</div></div>
     <div class="msg">最多 10 组，通过 MQTT 主题管理（每设备 <code>wakemanager/mac/&lt;设备ID&gt;</code>）。</div>
@@ -121,7 +135,48 @@ async function refreshStatus() {
       ? s.temp_c.toFixed(2) + ' °C' : '-';
     $('st_time').textContent = s.time || '(未同步)';
     $('st_bcast').textContent = s.broadcast || '-';
+    if (s.version !== undefined) renderOta(s.ota);
   } catch (e) { /* ignore transient errors */ }
+}
+
+const OTA_STATE_TEXT = {
+  idle: '空闲', checking: '检查中…', update_available: '发现新版本',
+  downloading: '下载中…', rebooting: '即将重启…', failed: '失败'
+};
+
+function renderOta(o) {
+  if (!o) return;
+  $('ota_cur').textContent = o.current || '-';
+  $('ota_latest').textContent = o.latest || '-';
+  let txt = OTA_STATE_TEXT[o.state] || o.state;
+  if (o.state === 'downloading' && typeof o.progress === 'number') {
+    txt += '（' + o.progress + '%）';
+  }
+  $('ota_state').textContent = txt;
+  // 只在发现新版本且未在下载时显示升级按钮
+  $('otaUpBtn').style.display =
+    (o.state === 'update_available') ? '' : 'none';
+  if (o.state === 'failed' && o.error) {
+    setMsg($('otaMsg'), '失败: ' + o.error, false);
+  } else if (o.state === 'rebooting') {
+    setMsg($('otaMsg'), '升级完成，设备正在重启…', true);
+  }
+}
+
+async function otaCheck() {
+  setMsg($('otaMsg'), '检查更新中…', true);
+  try {
+    const r = await fetch('/api/ota/check');
+    if (!r.ok) setMsg($('otaMsg'), '检查失败: ' + (await r.text() || r.status), false);
+  } catch (e) { setMsg($('otaMsg'), '请求失败', false); }
+}
+
+async function otaUpgrade() {
+  if (!confirm('确认升级到最新固件？升级过程中设备将重启。')) return;
+  try {
+    const r = await fetch('/api/ota', { method: 'POST' });
+    if (!r.ok) setMsg($('otaMsg'), '升级失败: ' + (await r.text() || r.status), false);
+  } catch (e) { setMsg($('otaMsg'), '请求失败', false); }
 }
 
 async function refreshMac() {

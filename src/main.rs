@@ -16,6 +16,7 @@ mod device_info;
 mod led_status;
 mod mac_store;
 mod netinfo;
+mod ota;
 mod serial_cmd;
 mod status;
 mod time_sync;

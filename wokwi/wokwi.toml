@@ -3,8 +3,8 @@
 # cli 则用 `wokwi-cli wokwi`（或 cd wokwi 后 `wokwi-cli .`）。
 #
 # firmware 指向 build/flasher_args.json（wokwi/build/）：Wokwi 按它装配完整 flash
-# 镜像（bootloader @0x0 + 自定义分区表 @0x8000 + app @0x10000），与 idf.py flash
-# 的行为一致。build/ 由 mkwokwi.sh 组装。
+# 镜像（bootloader @0x0 + 自定义分区表 @0x8000 + app @0x20000，OTA 双槽布局）。
+# build/ 由 mkwokwi.sh 组装。
 #
 # 模拟流程（仓库根执行）：
 #   cargo build --features sim      # sim 特性：跳过 BLE 配网，直连 Wokwi-GUEST

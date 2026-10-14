@@ -3,7 +3,10 @@ target = "xtensa-esp32s3-espidf"
 
 [target.'cfg(target_os = "espidf")']
 linker = "ldproxy"
-runner = "espflash flash --monitor"
+# --partition-table：显式传自定义分区表，espflash 才会把 app 烧到 ota_0（0x20000），
+# 否则默认写 0x10000（factory 布局的老偏移）→ OTA 双槽布局下启动报
+# "No bootable app partitions"
+runner = "espflash flash --monitor --partition-table partitions.csv"
 rustflags = [ "--cfg",  "espidf_time64"]
 
 [unstable]

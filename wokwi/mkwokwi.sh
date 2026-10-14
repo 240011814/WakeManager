@@ -113,11 +113,11 @@ cat > "$OUT_DIR/flasher_args.json" <<'EOF'
     "flash_files" : {
         "0x0" : "bootloader/bootloader.bin",
         "0x8000" : "partition_table/partition-table.bin",
-        "0x10000" : "wol-rs.bin"
+        "0x20000" : "wol-rs.bin"
     },
     "bootloader" : { "offset" : "0x0", "file" : "bootloader/bootloader.bin", "encrypted" : "false" },
     "partition-table" : { "offset" : "0x8000", "file" : "partition_table/partition-table.bin", "encrypted" : "false" },
-    "app" : { "offset" : "0x10000", "file" : "wol-rs.bin", "encrypted" : "false" },
+    "app" : { "offset" : "0x20000", "file" : "wol-rs.bin", "encrypted" : "false" },
     "extra_esptool_args" : {
         "after"  : "hard-reset",
         "before" : "default-reset",

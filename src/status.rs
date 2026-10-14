@@ -34,6 +34,10 @@ pub struct DeviceStatus {
     /// 开机时刻（首次 SNTP 校时后才有值，格式同 time）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boot_time: Option<String>,
+    /// 固件版本（OTA 用；构建时注入）
+    pub version: String,
+    /// OTA 状态（state/current/latest/progress/error）
+    pub ota: crate::ota::OtaStatus,
 }
 
 /// 设备状态快照；HTTP `/api/status`、MQTT 状态发布与串口 `status` 命令共用。
@@ -51,6 +55,8 @@ pub fn device_status() -> DeviceStatus {
         temp_c: crate::chip_temp::read().ok(),
         time: time_sync::is_synced().then(time_sync::format_now),
         boot_time: time_sync::boot_time(),
+        version: crate::app_config::VERSION.to_string(),
+        ota: crate::ota::status(),
     }
 }
 

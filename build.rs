@@ -8,6 +8,13 @@ fn main() {
     // 向 rustc 声明 esp-idf-sys 依据 sdkconfig 注入的 cfg（app_log.rs 用到），
     // 否则触发 unexpected_cfgs 警告
     println!("cargo:rustc-check-cfg=cfg(esp_idf_log_colors)");
+
+    // OTA 版本注入：CI 构建时导出 WOL_VERSION（tag 名或 git describe），
+    // 本地构建未设置时兜底 "dev"。app_config::VERSION 消费 env!("WOL_VERSION")。
+    let version = env::var("WOL_VERSION").unwrap_or_else(|_| "dev".into());
+    println!("cargo:rustc-env=WOL_VERSION={version}");
+    println!("cargo:rerun-if-env-changed=WOL_VERSION");
+
     embuild::espidf::sysenv::output();
     emit_clangd_db();
 }

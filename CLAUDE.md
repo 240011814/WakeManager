@@ -134,7 +134,7 @@ WakeManager/
 ├── bindings.h                  # bindgen 入口（network_provisioning + chip/flash info）
 ├── rust-toolchain.toml         # channel = "esp"
 ├── sdkconfig.defaults          # 栈大小 + NimBLE + protocomm security 1 + 自定义分区表（$ENV{PROJECT_DIR}）+ 8MB flash
-├── partitions.csv              # 自定义分区表（factory 3MB，编进构建）
+├── partitions.csv              # 自定义分区表（OTA 双槽 ota_0/ota_1，编进构建）
 ├── wokwi/                      # Wokwi 模拟相关统一放此子目录
 │   ├── wokwi.toml / diagram.json # 模拟入口与场景（elf → ../target/...，firmware → build/flasher_args.json）
 │   ├── mkwokwi.sh              # 组装 wokwi/build/（bootloader + 分区表 + elf2image 固件镜像）
@@ -160,6 +160,7 @@ WakeManager/
     ├── debug_uart.rs           # UART1 → GPIO43/44 命令口（收字节按 CR/LF 拼行）
     ├── serial_cmd.rs           # 串口命令分发（help / status / wifi-clear）
     ├── wifi_prov.rs            # BLE 配网（network_provisioning FFI；sim 直连 Wokwi-GUEST）
+    ├── ota.rs                  # OTA：GitHub Releases 版本检查 + 流式下载升级（esp_ota 双槽）
     ├── control_http.rs         # EspHttpServer（专属线程持有）+ 内嵌 index.html
     └── control_mqtt.rs         # EspMqttClient + 事件循环线程 + API 工作线程
 ```
@@ -217,11 +218,13 @@ WakeManager/
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | 内嵌单页 UI |
-| GET | `/api/status` | 状态 JSON：`id`、`ip`、`ssid`、`rssi`、`heap`、`mqtt_connected`、`broadcast`、`mac_count`、`temp_c`、`time` |
+| GET | `/api/status` | 状态 JSON：`id`、`ip`、`ssid`、`rssi`、`heap`、`mqtt_connected`、`broadcast`、`mac_count`、`temp_c`、`time`、`version`、`ota`（OTA 状态机） |
 | GET | `/api/config` | 当前配置 JSON |
 | POST | `/api/config` | 保存配置（`x-www-form-urlencoded`），随后重载 MQTT |
 | GET | `/api/wake` | 发送魔术包，**`?mac=<MAC>` 必传**，可选 `?ip=<IP>` |
 | GET | `/api/mac` | 地址簿 JSON：`{"count":n,"macs":[{"mac":...,"ip":...}]}` |
+| GET | `/api/ota/check` | 触发 OTA 版本检查（异步；结果经 `/api/status` 的 `ota` 字段轮询） |
+| POST | `/api/ota` | 触发 OTA 升级：下载 Release 的 `wol-rs.bin` → 写入非活动槽 → 校验 → 重启 |
 
 ## MQTT 协议
 
@@ -264,7 +267,18 @@ WakeManager/
 
 **命令格式仅支持 JSON。**
 
-## 代码规范
+## OTA 固件升级
+
+`ota.rs`（更新源：GitHub Releases 的 `wol-rs.bin` 资产，由 CI 打 tag 时上传）：
+
+- **版本注入**：build.rs 读环境变量 `WOL_VERSION`（CI 传 tag 名，本地兜底 `"dev"`）→ `app_config::VERSION`；`/api/status` 的 `version` 字段暴露。
+- **状态机**（全局 Mutex，`/api/status` 的 `ota` 字段轮询）：`idle / checking / update_available / downloading / rebooting / failed`；检查与下载都在 32KB 栈的专属线程跑（TLS 握手栈开销大，不能在 httpd 线程），进行中拒绝重复触发。
+- **检查**：`GET /api/ota/check` → `releases/latest` API（必须带 User-Agent，否则 GitHub 403）→ 取 `wol-rs.bin` 资产 URL → 与本机版本比对（`dev` 构建视为总是落后）。
+- **升级**：`POST /api/ota` → `EspHttpConnection`（`crt_bundle_attach` 证书 bundle + 跟随 302 到 objects.githubusercontent.com）流式下载 → `EspOta::initiate_update_with_known_size`（按 Content-Length 只擦需用扇区）→ `update.write()` 分片写 → `complete()` 校验镜像并切换启动分区 → 2s 后 `esp_restart()`。
+- **分区表**：`partitions.csv` 为 OTA 双槽布局（otadata + ota_0/ota_1 各 0x3D0000）；**NVS 偏移（0x9000）与旧 factory 布局一致**，存量配置不受影响。老固件（factory 布局）无法通过 OTA 迁移，**首次需串口全量烧录新分区表**。
+- 无 rollback（未开 `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`）：`esp_ota_end` 校验失败会中止，不会切换启动分区。
+
+
 
 - **一模块一文件**：每个功能放在 `src/<name>.rs`，模块顶部用 `//!` 写明对应原 C 组件。
 - 日志统一用 `log` crate（`log::info!` / `warn!` / `error!`）；注意 `esp_idf_sys::*` glob 里也有 `log`，需要时写 `::log::info!`。
@@ -289,7 +303,7 @@ WakeManager/
 - **MQTT 数据不是 NUL 结尾**：`EventPayload::Received` 的 `topic`/`data` 需按长度/UTF-8 处理，避免越界。
 - **看门狗**：`watchdog::init()` 会 `reconfigure`（IDF 默认已 `CONFIG_ESP_TASK_WDT_INIT` 自动初始化）；等待配网期间不要提前把主任务加入看门狗，应在开始循环喂狗后再 `add_current_task()`。
 - **SNTP**：现在走 esp-idf-svc 的 `EspSntp`（server 字符串生命周期由句柄托管，`main()` 保活）；时区仍用 `setenv("TZ", ...)` + `tzset()`（0.53 的 `SntpConf` 无 timezone 字段）。
-- **分区表**：`partitions.csv`（factory 0x300000）通过 `CONFIG_PARTITION_TABLE_CUSTOM=y` 编进构建；esp-idf-sys 的限制是**相对路径被解析到 cargo OUT_DIR**，`CUSTOM_FILENAME` 必须是绝对路径——写成 CMake 的 `"$ENV{PROJECT_DIR}/partitions.csv"`（esp-idf-sys 构建时始终把环境变量 `PROJECT_DIR` 设为 Cargo 工作区根目录，换机器不用改）。**不要用 `${PROJECT_PATH}`**：它只在 `project.cmake` 的 `__project_info()` 里有定义，而生成 `PARTITION_CSV_PATH` 的 `build.cmake` include sdkconfig.cmake 处变量为空，会退化成 `/partitions.csv`。flash size 相应设为 8MB。
+- **分区表**：`partitions.csv`（OTA 双槽布局）通过 `CONFIG_PARTITION_TABLE_CUSTOM=y` 编进构建；esp-idf-sys 的限制是**相对路径被解析到 cargo OUT_DIR**，`CUSTOM_FILENAME` 必须是绝对路径——写成 CMake 的 `"$ENV{PROJECT_DIR}/partitions.csv"`（esp-idf-sys 构建时始终把环境变量 `PROJECT_DIR` 设为 Cargo 工作区根目录，换机器不用改）。**不要用 `${PROJECT_PATH}`**：它只在 `project.cmake` 的 `__project_info()` 里有定义，而生成 `PARTITION_CSV_PATH` 的 `build.cmake` include sdkconfig.cmake 处变量为空，会退化成 `/partitions.csv`。flash size 相应设为 8MB。
   另注：esp-idf-sys 会把 `target/<triple>/<profile>/build/esp-idf-sys-*/out/sdkconfig` 作为**最后一个** defaults 文件传入（优先级最高），改 sdkconfig.defaults 时若该文件里已有旧值，需一并改掉或删除，否则不生效。
 - **Windows 构建目录**：esp-idf-sys 要求 canonicalize 后的 OUT_DIR ≤ 88 字符；`target` 是指向短路径（`D:\espbuild`）的 NTFS junction——产物在项目内可见、检查时解析回短路径。换机器需重建 junction（`New-Item -ItemType Junction`），不能用 subst（canonicalize 会还原成原长路径）。
 - **NVS 全新 flash 首启**：只读 `EspNvs::new(..., false)` 在命名空间不存在时返回 `ESP_ERR_NVS_NOT_FOUND`，`config_store`/`mac_store` 的 `init` 必须按"无存储配置"处理而非上抛（此 bug 由 Wokwi 模拟发现——真机全擦后首启会 abort 重启循环）。

@@ -50,6 +50,16 @@ pub const PROV_QR_TRANSPORT: &str = "ble";
 pub const PROV_QRCODE_BASE_URL: &str =
     "https://espressif.github.io/esp-jumpstart/qrcode.html";
 
+/* ---------- OTA (GitHub Releases) ---------- */
+
+/// 构建时注入的版本号（CI 传 WOL_VERSION，本地为 "dev"）
+pub const VERSION: &str = env!("WOL_VERSION");
+
+/// OTA 更新源仓库的 Release 中裸固件资产名（CI 上传）
+pub const OTA_ASSET_NAME: &str = "wol-rs.bin";
+/// 版本检查 API（GitHub releases/latest；仓库写死于此常量）
+pub const OTA_CHECK_URL: &str = "https://api.github.com/repos/240011814/WakeManager/releases/latest";
+
 /* ---------- Address book ---------- */
 
 /// Maximum number of stored MAC/IP entries.
