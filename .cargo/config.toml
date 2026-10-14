@@ -6,7 +6,10 @@ linker = "ldproxy"
 # --partition-table：显式传自定义分区表，espflash 才会把 app 烧到 ota_0（0x20000），
 # 否则默认写 0x10000（factory 布局的老偏移）→ OTA 双槽布局下启动报
 # "No bootable app partitions"
-runner = "espflash flash --monitor --partition-table partitions.csv"
+# --erase-parts otadata：每次清掉启动槽选择（otadata 0xf000/0x2000）。OTA 升级过的
+# 设备 otadata 仍指向下载固件所在槽（如 ota_1），只烧 ota_0 的话重启后跑的还是
+# 旧的下载版；otadata 清空后 bootloader 回退到 ota_0（本布局无 factory 分区）
+runner = "espflash flash --monitor --partition-table partitions.csv --erase-parts otadata"
 rustflags = [ "--cfg",  "espidf_time64"]
 
 [unstable]

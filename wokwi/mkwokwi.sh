@@ -98,6 +98,12 @@ mkdir -p "$OUT_DIR/bootloader" "$OUT_DIR/partition_table"
 cp "$SYS_BUILD/bootloader/bootloader.bin" "$OUT_DIR/bootloader/"
 cp "$SYS_BUILD/partition_table/partition-table.bin" "$OUT_DIR/partition_table/"
 
+# 空白 otadata（全 0xFF = 未选择启动槽），烧录时一并写入 0xf000 强制 bootloader
+# 回到 ota_0：否则 OTA 升级过的设备 otadata 指向另一槽（如 ota_1），
+# 新烧的固件躺在 ota_0 里不被启动（"烧录后还是跑下载的版本"）。
+# LC_ALL=C 必带：BSD tr 否则把 \377 按 UTF-8 编码成 2 字节，文件会大一倍
+head -c 8192 /dev/zero | LC_ALL=C tr '\0' '\377' > "$OUT_DIR/otadata.bin"
+
 # flasher_args.json：Wokwi / ESP-IDF 插件据此装配完整 flash 镜像（app 指向固件
 # 镜像而非 esp-idf-sys CMake 产物 libespidf.bin —— 那里面没有 Rust 代码）
 cat > "$OUT_DIR/flasher_args.json" <<'EOF'
@@ -113,6 +119,7 @@ cat > "$OUT_DIR/flasher_args.json" <<'EOF'
     "flash_files" : {
         "0x0" : "bootloader/bootloader.bin",
         "0x8000" : "partition_table/partition-table.bin",
+        "0xf000" : "otadata.bin",
         "0x20000" : "wol-rs.bin"
     },
     "bootloader" : { "offset" : "0x0", "file" : "bootloader/bootloader.bin", "encrypted" : "false" },

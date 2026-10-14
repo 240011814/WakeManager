@@ -131,7 +131,7 @@ jobs:
             echo
             echo "## 最新构建 (${{ github.ref_name }} @ ${{ steps.prep.outputs.commit }})"
             echo
-            echo "烧录：\`esptool.py --chip esp32s3 write_flash 0x0 bootloader/bootloader.bin 0x8000 partition_table/partition-table.bin 0x10000 wol-rs.bin\`"
+            echo "烧录：\`esptool.py --chip esp32s3 write_flash 0x0 bootloader/bootloader.bin 0x8000 partition_table/partition-table.bin 0x20000 wol-rs.bin\`"
             echo
             echo "| 文件 | 下载 |"
             echo "| --- | --- |"
@@ -197,11 +197,13 @@ jobs:
 
           ## 烧录
 
+          OTA 升级过的设备先清 otadata（启动槽选择）：esptool.py --chip esp32s3 erase-region 0xf000 0x2000，否则重启后仍跑旧槽里的固件。
+
           \`\`\`bash
           esptool.py --chip esp32s3 write_flash \\
             0x bootloader/bootloader.bin \\
             0x8000 partition_table/partition-table.bin \\
-            0x10000 wol-rs.bin
+            0x20000 wol-rs.bin
           \`\`\`
 
           校验和见 zip 内 \`SHA256SUMS\`。
