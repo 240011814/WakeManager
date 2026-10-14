@@ -74,18 +74,15 @@ jobs:
           restore-keys: |
             fw-${{ runner.os }}-
 
-      - name: 安装 Xtensa Rust 工具链 (espup)
+      # 注意：仓库根的 rust-toolchain.toml 指向 channel="esp"，而 esp 工具链正是
+      # 本步才安装 → cargo 必须用 RUSTUP_TOOLCHAIN=stable 覆盖 override，
+      # 否则 rustup 报 "custom toolchain 'esp' ... is not installed"
+      - name: 安装 Xtensa Rust 工具链 (espup) 与 ldproxy
         run: |
-          cargo install espup --locked
-          espup install --targets esp32s3 --toolchain-version esp
+          RUSTUP_TOOLCHAIN=stable cargo install espup ldproxy --locked
+          RUSTUP_TOOLCHAIN=stable espup install --targets esp32s3 --toolchain-version esp
           # espup 未安装过时才会生成；缺失则兜底写一个
           [ -f "$HOME/export-esp.sh" ] || echo 'export LIBCLANG_PATH="$HOME/.espressif/llvm-xtensa/lib"' > "$HOME/export-esp.sh"
-
-      - name: 安装 ldproxy
-        run: |
-          . "$HOME/export-esp.sh"
-          . "$HOME/.cargo/env"
-          command -v ldproxy >/dev/null || cargo install ldproxy --locked
 
       - name: 构建 release 固件并组装烧录镜像
         run: |
