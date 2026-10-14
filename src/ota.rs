@@ -124,12 +124,52 @@ fn has_update(current: &str, latest: &str) -> bool {
 /* ---------------- HTTP 基础 ---------------- */
 
 /// 发起 GET 并完成响应头读取；TLS 用 IDF 证书 bundle（覆盖 GitHub 证书链）。
+///
+/// 手动跟随 3xx 重定向（最多 5 跳）：release 资产的 browser_download_url 会
+/// 302 到 objects.githubusercontent.com，而 esp_http_client 的自动重定向在
+/// 跨主机时有 "delayed connect error: Software caused connection abort"
+/// 的已知问题（旧 socket 未干净关闭就开新连接）→ 这里关掉自动重定向，
+/// 每一跳用全新连接手动跟 Location。
 fn http_get(uri: &str) -> Result<EspHttpConnection, String> {
+    let mut current = uri.to_string();
+    for _ in 0..5 {
+        let conn = http_get_once(&current)?;
+        let status = conn.status();
+        if (300..400).contains(&status) {
+            let location = conn.header("Location").map(|s| s.to_string());
+            let Some(loc) = location.filter(|l| !l.is_empty()) else {
+                return Err(format!("redirect {status} without Location"));
+            };
+            // drop conn（关闭连接）后再开下一跳
+            drop(conn);
+            // Location 可能是相对路径；GitHub 两个跳转都是绝对 URL，
+            // 相对时按当前 URI 的 scheme+host 拼接
+            current = if loc.starts_with("http://") || loc.starts_with("https://") {
+                loc
+            } else {
+                let origin = current
+                    .split_once("://")
+                    .map(|(sch, rest)| {
+                        let host = rest.split('/').next().unwrap_or("");
+                        format!("{sch}://{host}")
+                    })
+                    .unwrap_or_default();
+                format!("{origin}{loc}")
+            };
+            ::log::info!("OTA: following redirect to {}", current);
+            continue;
+        }
+        return Ok(conn);
+    }
+    Err("too many redirects".into())
+}
+
+fn http_get_once(uri: &str) -> Result<EspHttpConnection, String> {
     let mut conn = EspHttpConnection::new(&HttpConfiguration {
         buffer_size: Some(2048),
         timeout: Some(Duration::from_secs(30)),
-        // GitHub release 资产下载会 302 到 objects.githubusercontent.com
-        follow_redirects_policy: FollowRedirectsPolicy::FollowGetHead,
+        // 重定向由 http_get 手动处理（自动重定向跨主机有已知 bug）
+        follow_redirects_policy: FollowRedirectsPolicy::FollowNone,
         crt_bundle_attach: Some(esp_crt_bundle_attach),
         ..Default::default()
     })
