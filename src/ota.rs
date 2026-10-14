@@ -102,7 +102,7 @@ fn set_state(state: &'static str, latest: Option<String>, progress: Option<u32>,
 #[derive(Deserialize)]
 struct GhRelease {
     tag_name: String,
-    /// Release 目标 commit（创建草稿时由 CI 传入 github.sha）——版本检查
+    /// Release 目标 commit（CI 发布滚动 Release 时传入 github.sha）——版本检查
     /// 只靠 API 响应字段，不下载任何资产（资产域名国内直连不稳）
     target_commitish: String,
     assets: Vec<GhAsset>,
@@ -297,7 +297,7 @@ fn do_check() -> Result<String, String> {
         *cell = candidates;
     }
 
-    // 版本 = Release 目标 commit 的短 SHA（CI 建草稿时写入 github.sha）；
+    // 版本 = Release 目标 commit 的短 SHA（CI 发布滚动 Release 时写入 github.sha）；
     // 只用 API 响应字段，不再下载 manifest.json（资产域名国内直连不稳）
     Ok(short_sha(&release.target_commitish))
 }

@@ -1,10 +1,10 @@
 name: Build Firmware
 
-# 触发：push main / 打 tag(v*) / 手动
+# 触发：push rust 分支 / 手动。不依赖 tag：每次构建成功都更新滚动 Release
+# （固定 tag=latest，删旧建新，资产全量替换）
 on:
   push:
     branches: [rust]
-    tags: ['v*']
   workflow_dispatch:
 
 # 推送固件分支、创建 Release 需要写权限
@@ -20,31 +20,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 打 tag 时先创建草稿 Release，拿到 release_id 交给构建 job 上传产物；
-  # 全部产物上传完成后由 publish_release 统一公开，避免半成品 Release 暴露
-  prepare_release:
-    name: 创建草稿 Release (tag only)
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    outputs:
-      release_id: ${{ steps.create_draft.outputs.id }}
-    steps:
-      - name: Create or update draft release
-        id: create_draft
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ github.ref_name }}
-          target_commitish: ${{ github.sha }}
-          name: 'WakeManager ${{ github.ref_name }}'
-          body: 'Draft release, will be updated after all artifacts are uploaded.'
-          token: ${{ secrets.GITHUB_TOKEN }}
-          draft: true
-
   build:
     name: 构建 ESP32-S3 固件
-    needs: [prepare_release]
-    # prepare_release 因非 tag 跳过时，build 照常执行（push main / 手动）
-    if: always() && needs.prepare_release.result != 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -110,12 +87,11 @@ jobs:
           (cd "$STAGE" && sha256sum $(find . -type f | sort) > SHA256SUMS)
           # 版本标记
           echo "commit=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           ls -lhR "$STAGE"
 
       # 产物推送到专用分发分支 firmware（孤儿提交 + force push，分支体积恒定）：
       #   firmware/latest/            每次构建覆盖
-      #   firmware/releases/<tag>/    打 tag 时归档
+      #   firmware/releases/<tag>/    历史 tag 归档（只读保留，不再新增）
       #   firmware/README.md          下载索引
       # 注意：绝对不要用 main/rust 等开发分支做产物分支——force push 会清空源码！
       - name: 推送产物到 firmware 分支
@@ -143,13 +119,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # latest/ 每次覆盖；tag 时额外归档一份
+          # latest/ 每次覆盖；不再按 tag 归档（历史 releases/ 保留不动）
           mkdir -p latest
           cp -r "$GITHUB_WORKSPACE/$STAGE/." latest/
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            mkdir -p "releases/${{ steps.prep.outputs.tag }}"
-            cp -r "$GITHUB_WORKSPACE/$STAGE/." "releases/${{ steps.prep.outputs.tag }}/"
-          fi
 
           # 生成 README 下载索引（仿 Release list）
           {
@@ -157,7 +129,7 @@ jobs:
             echo
             echo "> 本分支由 GitHub Actions 自动维护，仅存放构建产物，请勿手动提交。"
             echo
-            echo "## 最新构建 (main @ ${{ steps.prep.outputs.commit }})"
+            echo "## 最新构建 (${{ github.ref_name }} @ ${{ steps.prep.outputs.commit }})"
             echo
             echo "烧录：\`esptool.py --chip esp32s3 write_flash 0x0 bootloader/bootloader.bin 0x8000 partition_table/partition-table.bin 0x10000 wol-rs.bin\`"
             echo
@@ -179,123 +151,89 @@ jobs:
           } > README.md
 
           git add -A
-          git commit -q -m "build: ${{ steps.prep.outputs.tag }} (${{ steps.prep.outputs.commit }}) [skip ci]"
+          git commit -q -m "build: ${{ github.ref_name }} @ ${{ steps.prep.outputs.commit }} [skip ci]"
           git remote add origin "$REPO_URL"
           # 覆盖式推送：latest/ 目录每次全量替换，避免历史膨胀
           git push --force origin "$BRANCH"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 打 tag 时把镜像 zip + 裸固件 wol-rs.bin + manifest.json 上传到草稿 Release
-      # （wol-rs.bin 是设备 OTA 的下载源，manifest.json 供工具消费；--clobber 支持重跑覆盖）
-      - name: 上传产物到草稿 Release (tag only)
-        if: startsWith(github.ref, 'refs/tags/')
+      # 滚动 Release（固定 tag "latest"）：每次构建成功后删旧建新并上传产物
+      # （wol-rs.bin 是设备 OTA 的下载源，manifest.json 供工具消费）。
+      # 必须"删旧建新"而不是 PATCH 更新：GitHub API 更新 Release 时 target_commitish
+      # 在 tag（Git ref）已存在的情况下会被忽略，而设备 OTA 靠它比对版本；
+      # 删 tag + 重建保证 target_commitish = 本次 commit，旧资产也随之清空
+      - name: 更新滚动 Release (latest)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ needs.prepare_release.outputs.release_id }}
         run: |
           set -euo pipefail
-          if [ -z "$RELEASE_ID" ]; then
-            echo "::error::No prepared release ID found for ${{ steps.prep.outputs.tag }}."
-            exit 1
-          fi
+          SHORT="${GITHUB_SHA::7}"
+          BUILDTIME="$(TZ=Asia/Shanghai date)"
+
           # manifest.json：版本（commit 短 SHA）+ 提交 + 各文件 sha256
           (cd firmware-dist && sha256sum wol-rs.bin bootloader/bootloader.bin partition_table/partition-table.bin) > /tmp/sha.txt
           cat > firmware-dist/manifest.json << EOF
           {
-            "version": "${GITHUB_SHA::7}",
+            "version": "$SHORT",
             "commit": "${{ github.sha }}",
             "chip": "esp32s3",
             "sha256": {$(awk '{printf "    \"%s\": \"%s\",\n", $2, $1}' /tmp/sha.txt | sed '$ s/,$//')}
           }
           EOF
           cd firmware-dist
-          zip -r "../wol-rs-${{ steps.prep.outputs.tag }}.zip" .
+          zip -r "../wol-rs-latest.zip" .
           cd ..
-          gh release upload "${{ steps.prep.outputs.tag }}" \
-            "wol-rs-${{ steps.prep.outputs.tag }}.zip" \
-            firmware-dist/wol-rs.bin \
-            firmware-dist/manifest.json \
-            --clobber
 
-      - name: 上传 Actions 构件（备份）
-        uses: actions/upload-artifact@v4
-        with:
-          name: wol-rs-${{ steps.prep.outputs.tag }}
-          path: firmware-dist/
-          if-no-files-found: error
-
-  # 全部产物上传完成后，写入正式 release body 并把草稿改为公开
-  publish_release:
-    name: 发布 Release (tag only)
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [prepare_release, build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Set Env
-        run: |
-          echo "BUILDTIME=$(TZ=Asia/Shanghai date)" >> "$GITHUB_ENV"
-          echo "TAG_NAME=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
-          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-          echo "DOWNLOAD_URL=https://github.com/${GITHUB_REPOSITORY}/releases/download/$GITHUB_REF_NAME" >> "$GITHUB_ENV"
-
-      - name: Generate release body
-        run: |
           cat > release.txt << EOF
-          ESP32-S3 网络唤醒控制器固件（Rust / ESP-IDF v6.1），commit ${GITHUB_SHA::7}。
+          ESP32-S3 网络唤醒控制器固件（Rust / ESP-IDF v6.1），commit $SHORT。
+
+          滚动构建：每次构建成功自动覆盖本 Release（tag 固定为 latest）。
 
           ## 下载
 
-          - [完整烧录镜像 zip](${{ env.DOWNLOAD_URL }}/wol-rs-${{ env.TAG_NAME }}.zip)（bootloader + 分区表 + 固件，解压后用下方命令烧录）
+          - [完整烧录镜像 zip](https://github.com/${{ github.repository }}/releases/download/latest/wol-rs-latest.zip)（bootloader + 分区表 + 固件）
+          - \`wol-rs.bin\`：设备 OTA 升级源
 
           ## 烧录
 
           \`\`\`bash
           esptool.py --chip esp32s3 write_flash \\
-            0x0 bootloader/bootloader.bin \\
+            0x bootloader/bootloader.bin \\
             0x8000 partition_table/partition-table.bin \\
             0x10000 wol-rs.bin
           \`\`\`
 
-          或使用 cargo-espflash：\`cargo espflash flash --monitor\`（需在源码 checkout 下对应 tag 构建）。
-
           校验和见 zip 内 \`SHA256SUMS\`。
 
-          Created at ${{ env.BUILDTIME }}.
+          Created at $BUILDTIME.
           EOF
 
-      - name: Publish Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          release_id="${{ needs.prepare_release.outputs.release_id }}"
+          # 删旧滚动 Release（连同 tag）；不存在时忽略
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
 
-          if [ -z "$release_id" ]; then
-            echo "::error::No prepared release ID found for $TAG_NAME."
+          # --target：tag 不存在则建在本次 commit 上（设备 OTA 读 target_commitish 比对版本）
+          # --latest：标记为仓库的 latest release（releases/latest API 的返回源）
+          gh release create latest \
+            --target "${{ github.sha }}" \
+            --title "WakeManager latest (${{ github.ref_name }} @ $SHORT)" \
+            --notes-file release.txt \
+            --latest \
+            wol-rs-latest.zip \
+            firmware-dist/wol-rs.bin \
+            firmware-dist/manifest.json
+
+          # 防半成品：资产不齐不放行
+          count=$(gh release view latest --json assets --jq '.assets | length')
+          if [ "$count" -lt 3 ]; then
+            echo "::error::Release latest has only $count assets, expected 3."
             exit 1
           fi
+          echo "Rolling release updated: $SHORT, $count assets."
 
-          # 校验草稿确实属于当前 tag，避免误发布
-          release_info=$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" --jq '[.tag_name, .draft, (.assets | length), .html_url] | @tsv')
-          IFS=$'\t' read -r release_tag _ asset_count release_url <<< "$release_info"
-
-          if [ "$release_tag" != "$TAG_NAME" ]; then
-            echo "::error::Prepared release $release_id belongs to $release_tag, expected $TAG_NAME."
-            exit 1
-          fi
-
-          if [ "$asset_count" -eq 0 ]; then
-            echo "::error::Release $TAG_NAME has no assets, refusing to publish."
-            exit 1
-          fi
-
-          echo "Publishing release $release_id ($release_url) with $asset_count assets."
-
-          # 路径直接用 $GITHUB_REPOSITORY 拼接：{owner}/{repo} 占位符需要 git
-          # 上下文展开，而本 job 未 checkout；gh api 也没有 --repo 参数
-          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
-            -f name="WakeManager $TAG_NAME" \
-            -F body=@release.txt \
-            -F draft=false \
-            --silent
+      - name: 上传 Actions 构件（备份）
+        uses: actions/upload-artifact@v4
+        with:
+          name: wol-rs-${{ steps.prep.outputs.commit }}
+          path: firmware-dist/
+          if-no-files-found: error
