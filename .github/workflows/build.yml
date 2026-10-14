@@ -109,14 +109,15 @@ jobs:
           echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           ls -lhR "$STAGE"
 
-      # 产物推送到独立分支 rust（孤儿分支，不参与主线历史）：
-      #   rust/latest/            每次构建覆盖
-      #   rust/releases/<tag>/    打 tag 时归档
-      #   rust/README.md          下载索引
-      - name: 推送产物到 rust 分支
+      # 产物推送到专用分发分支 firmware（孤儿提交 + force push，分支体积恒定）：
+      #   firmware/latest/            每次构建覆盖
+      #   firmware/releases/<tag>/    打 tag 时归档
+      #   firmware/README.md          下载索引
+      # 注意：绝对不要用 main/rust 等开发分支做产物分支——force push 会清空源码！
+      - name: 推送产物到 firmware 分支
         run: |
           set -euo pipefail
-          BRANCH=rust
+          BRANCH=firmware
           STAGE=firmware-dist
           ARCH=$RUNNER_TEMP/fw-archive
           WORK=$RUNNER_TEMP/fw-branch
@@ -124,7 +125,7 @@ jobs:
           rm -rf "$ARCH" "$WORK"
           mkdir -p "$WORK"
 
-          # 先抢救现有 rust 分支上的 tag 归档（releases/），孤儿提交会丢历史
+          # 先抢救现有产物分支上的 tag 归档（releases/），孤儿提交会丢历史
           if git ls-remote --exit-code --heads "$REPO_URL" "$BRANCH" >/dev/null 2>&1; then
             git clone --depth 1 --branch "$BRANCH" --single-branch "$REPO_URL" "$ARCH" -q || true
             [ -d "$ARCH/releases" ] && cp -r "$ARCH/releases" "$WORK/releases" || true
