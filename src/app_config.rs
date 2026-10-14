@@ -24,6 +24,8 @@ pub const WOL_MQTT_BROADCAST_TOPIC: &str = "wakemanager/broadcast";
 pub const WOL_MQTT_STATUS_TOPIC: &str = "wakemanager/status";
 pub const WOL_MQTT_MAC_TOPIC: &str = "wakemanager/mac";
 pub const WOL_MQTT_MAC_GET_TOPIC: &str = "wakemanager/mac/get";
+/// OTA 升级命令主题（每设备追加 /<id>）：check / upgrade / status
+pub const WOL_MQTT_OTA_TOPIC: &str = "wakemanager/ota";
 
 /* ---------- Time sync (SNTP) ---------- */
 

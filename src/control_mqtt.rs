@@ -5,6 +5,7 @@
 //!   - broadcast（共享）：发现/status 查询
 //!   - cmd/<id>：唤醒命令
 //!   - mac/<id>、mac/get/<id>：地址簿管理/查询
+//!   - ota/<id>：OTA 升级命令（check / upgrade / status）
 //! 发布：
 //!   - status：命令结果、发现应答、地址簿列表
 //!
@@ -47,12 +48,13 @@ static WORKER_THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 /// 事件循环线程，`stop()` 时 join。
 static EVENT_THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
-/// 已解析的四个订阅主题（fixed base + "/" + device id）
+/// 已解析的订阅主题（fixed base + "/" + device id）
 struct Topics {
     bcast: String,
     wake: String,
     mac: String,
     mac_get: String,
+    ota: String,
 }
 
 static TOPICS: OnceLock<Topics> = OnceLock::new();
@@ -224,6 +226,41 @@ fn handle_mac_get_command(_cmd: &str) {
     publish_mac_list();
 }
 
+/// OTA 命令（ota/<id>）：`{"cmd":"check"}` / `{"cmd":"upgrade"}` / `{"cmd":"status"}`
+/// check/upgrade 只触发（检查/下载在 OTA 专属线程跑），结果与进度经
+/// status 主题的 `{"cmd":"status"}` 应答或设备状态快照里的 ota 字段回传
+fn handle_ota_command(cmd: &str) {
+    let text = trim(cmd);
+    if text.is_empty() {
+        publish_status("error: empty command on ota topic");
+        return;
+    }
+    let Some(c) = parse_command(text) else {
+        ::log::warn!("Invalid JSON ota command: \"{cmd}\"");
+        publish_status("error: invalid JSON command");
+        return;
+    };
+
+    let n = c.name.to_lowercase();
+    if n == "check" {
+        match crate::ota::start_check() {
+            Ok(()) => publish_status("ok: version check started"),
+            Err(e) => publish_status(&format!("error: {e}")),
+        }
+    } else if n == "upgrade" {
+        match crate::ota::start_upgrade() {
+            Ok(()) => publish_status("ok: upgrade started, device will reboot when done"),
+            Err(e) => publish_status(&format!("error: {e}")),
+        }
+    } else if n == "status" {
+        ::log::info!("OTA status requested on ota topic");
+        publish_device_status();
+    } else {
+        ::log::warn!("Unsupported command \"{}\" on ota topic", c.name);
+        publish_status("error: unsupported command on ota topic");
+    }
+}
+
 /// 发现命令（共享 broadcast）：`{"cmd":"status"}`，空载荷也触发
 fn handle_broadcast_command(cmd: &str) {
     let text = trim(cmd);
@@ -286,7 +323,8 @@ fn handle_event(event: &EspMqttEvent<'_>) {
             let is_bcast = topic == topics.bcast.as_str();
             let is_mac = topic == topics.mac.as_str();
             let is_mac_get = topic == topics.mac_get.as_str();
-            if !is_wake && !is_bcast && !is_mac && !is_mac_get {
+            let is_ota = topic == topics.ota.as_str();
+            if !is_wake && !is_bcast && !is_mac && !is_mac_get && !is_ota {
                 return;
             }
 
@@ -343,6 +381,8 @@ fn handle_event(event: &EspMqttEvent<'_>) {
                     handle_mac_set_command(&text);
                 } else if is_mac_get {
                     handle_mac_get_command(&text);
+                } else if is_ota {
+                    handle_ota_command(&text);
                 } else {
                     handle_broadcast_command(&text);
                 }
@@ -379,6 +419,7 @@ fn api_worker(mut client: EspMqttClient<'static>, rx: mpsc::Receiver<ApiOp>) {
                     ("wake", &topics.wake),
                     ("mac", &topics.mac),
                     ("mac get", &topics.mac_get),
+                    ("ota", &topics.ota),
                 ] {
                     match client.subscribe(t, QoS::AtLeastOnce) {
                         Ok(id) => ::log::info!("Subscribed to {label} topic {t} (msg_id={id})"),
@@ -461,6 +502,7 @@ pub fn start() -> Result<(), MqttStartError> {
         wake: format!("{}/{}", ac::WOL_MQTT_CMD_TOPIC, dev_id),
         mac: format!("{}/{}", ac::WOL_MQTT_MAC_TOPIC, dev_id),
         mac_get: format!("{}/{}", ac::WOL_MQTT_MAC_GET_TOPIC, dev_id),
+        ota: format!("{}/{}", ac::WOL_MQTT_OTA_TOPIC, dev_id),
     });
 
     // 诊断：日志打印 broker 域名解析结果
@@ -509,11 +551,12 @@ pub fn start() -> Result<(), MqttStartError> {
     ::log::info!("MQTT client starting, broker: {}, id: {}", cfg.mqtt_uri, dev_id);
     if let Some(t) = TOPICS.get() {
         ::log::info!(
-            "Topics: broadcast={} wake={} mac={} mac_get={} status={}",
+            "Topics: broadcast={} wake={} mac={} mac_get={} ota={} status={}",
             t.bcast,
             t.wake,
             t.mac,
             t.mac_get,
+            t.ota,
             ac::WOL_MQTT_STATUS_TOPIC
         );
     }

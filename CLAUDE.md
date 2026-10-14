@@ -84,7 +84,7 @@
 **WakeManager** 是一个基于 **ESP-IDF v6.1** 的 ESP32-S3 网络唤醒（Wake-on-LAN）控制器。设备通过 BLE 配网接入 Wi-Fi 后，提供两种控制方式：
 
 - **HTTP**：内置单页 Web UI + REST API，用于查看状态、立即唤醒、修改配置。
-- **MQTT**：远程唤醒设备、发现设备（获取设备唯一 ID）、管理地址簿。
+- **MQTT**：远程唤醒设备、发现设备（获取设备唯一 ID）、管理地址簿、触发 OTA 升级。
 
 核心能力：
 
@@ -179,7 +179,7 @@ WakeManager/
 
 > **无默认目标 MAC、无广播地址配置项。** 唤醒时 `mac` 必传；目标地址按 运行时 `ip` → 地址簿中该 MAC 的 IP → 自动推导的子网广播 依次决定。
 
-> **MQTT 主题不再是运行时可配置项**，全部固定为 `app_config.rs` 中的常量：`WOL_MQTT_CMD_TOPIC`、`WOL_MQTT_BROADCAST_TOPIC`、`WOL_MQTT_STATUS_TOPIC`、`WOL_MQTT_MAC_TOPIC`、`WOL_MQTT_MAC_GET_TOPIC`。
+> **MQTT 主题不再是运行时可配置项**，全部固定为 `app_config.rs` 中的常量：`WOL_MQTT_CMD_TOPIC`、`WOL_MQTT_BROADCAST_TOPIC`、`WOL_MQTT_STATUS_TOPIC`、`WOL_MQTT_MAC_TOPIC`、`WOL_MQTT_MAC_GET_TOPIC`、`WOL_MQTT_OTA_TOPIC`。
 
 ## MAC/IP 地址簿（mac_store）
 
@@ -230,7 +230,7 @@ WakeManager/
 
 `control_mqtt.rs`。设备 ID（`id`）= Wi-Fi STA MAC 的 12 位大写十六进制，如 `A1B2C3D4E5F6`。
 
-**订阅四个主题**（主题全部固定，`<id>` = 设备 ID）：
+**订阅五个主题**（主题全部固定，`<id>` = 设备 ID）：
 
 1. **广播主题**（共享，`WOL_MQTT_BROADCAST_TOPIC` = `broadcast`）
    - 所有设备都订阅；远程在不知道任何设备 ID 时用它做**设备发现**。
@@ -250,6 +250,12 @@ WakeManager/
 4. **地址簿获取主题**（每设备，`WOL_MQTT_MAC_GET_TOPIC` + `/<id>`，如 `mac/get/A1B2C3D4E5F6`）
    - 收到 `{"cmd":"get"}`（或空消息）→ 把完整列表发布到状态主题。
    - 列表 JSON：`{"id":"A1B2C3D4E5F6","cmd":"mac_list","count":2,"macs":[{"mac":"AA:BB:...","ip":"192.168.1.5"},...]}`
+
+5. **OTA 升级主题**（每设备，`WOL_MQTT_OTA_TOPIC` + `/<id>`，如 `ota/A1B2C3D4E5F6`）
+   - 检查更新：`{"cmd":"check"}` → 回 `ok: version check started`，完成后状态快照 `ota` 字段为 `update_available`/`idle`（`latest` = 新版本短 SHA）。
+   - 开始升级：`{"cmd":"upgrade"}` → 回 `ok: upgrade started, device will reboot when done` 或 `error: 请先检查更新`；下载进度在状态快照 `ota.progress`，完成后设备自动重启。
+   - 查状态：`{"cmd":"status"}` → 发布设备状态快照（含 `version` 与 `ota` 状态机）。
+   - check/upgrade 只做触发（检查/下载在 OTA 专属 32KB 栈线程跑），进行中重复触发会回 `error: OTA 正在进行中`。
 
 **发布：** 命令结果、发现应答、地址簿列表发布到 `WOL_MQTT_STATUS_TOPIC`（`status`）。芯片温度仅在按需发布的状态快照（`temp_c` 字段）中返回。
 

@@ -51,6 +51,7 @@
       <div class="k">芯片温度</div><div id="st_temp">-</div>
       <div class="k">时间</div><div id="st_time">-</div>
       <div class="k">广播地址</div><div id="st_bcast">-</div>
+      <div class="k">固件版本</div><div id="st_version">-</div>
     </div>
   </div>
 
@@ -135,6 +136,7 @@ async function refreshStatus() {
       ? s.temp_c.toFixed(2) + ' °C' : '-';
     $('st_time').textContent = s.time || '(未同步)';
     $('st_bcast').textContent = s.broadcast || '-';
+    $('st_version').textContent = s.version || '-';
     if (s.version !== undefined) renderOta(s.ota);
   } catch (e) { /* ignore transient errors */ }
 }
