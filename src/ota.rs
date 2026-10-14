@@ -190,6 +190,10 @@ fn check_worker() {
 
 fn do_check() -> Result<String, String> {
     let mut conn = http_get(ac::OTA_CHECK_URL)?;
+    // GitHub 在仓库没有任何已发布 Release 时对 latest 接口返回 404
+    if conn.status() == 404 {
+        return Err("服务器上还没有已发布的版本".into());
+    }
     if conn.status() != 200 {
         return Err(format!("check HTTP {}", conn.status()));
     }
