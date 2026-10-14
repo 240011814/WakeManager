@@ -91,6 +91,9 @@ fn set_state(state: &'static str, latest: Option<String>, progress: Option<u32>,
 #[derive(Deserialize)]
 struct GhRelease {
     tag_name: String,
+    /// Release 目标 commit（创建草稿时由 CI 传入 github.sha）——版本检查
+    /// 只靠 API 响应字段，不下载任何资产（资产域名国内直连不稳）
+    target_commitish: String,
     assets: Vec<GhAsset>,
 }
 
@@ -98,12 +101,6 @@ struct GhRelease {
 struct GhAsset {
     name: String,
     browser_download_url: String,
-}
-
-/// manifest.json（CI 上传的 Release 资产）：版本即 commit
-#[derive(Deserialize)]
-struct OtaManifest {
-    commit: String,
 }
 
 /// commit 短 SHA（7 位，与 CI 注入的 WOL_VERSION 格式一致）
@@ -261,41 +258,14 @@ fn do_check() -> Result<String, String> {
         .find(|a| a.name == ac::OTA_ASSET_NAME)
         .ok_or_else(|| format!("release {} has no asset {}", release.tag_name, ac::OTA_ASSET_NAME))?;
 
-    // 下载地址留给 start_upgrade
+    // 下载地址留给 start_upgrade（镜像前缀 + 直连两个候选，升级时依次尝试）
     if let Ok(mut cell) = latest_url_cell().lock() {
         *cell = Some(asset.browser_download_url.clone());
     }
 
-    // 版本取自 manifest.json 的 commit（tag 只是发布载体，不作为版本）
-    let manifest_url = release
-        .assets
-        .iter()
-        .find(|a| a.name == "manifest.json")
-        .map(|a| a.browser_download_url.clone())
-        .ok_or("release has no manifest.json")?;
-    let manifest: OtaManifest = fetch_json(&manifest_url)?;
-    Ok(short_sha(&manifest.commit))
-}
-
-/// GET 一个 JSON 资产并解析（manifest 通常 < 1KB）
-fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
-    let mut conn = http_get(url)?;
-    if conn.status() != 200 {
-        return Err(format!("fetch HTTP {}", conn.status()));
-    }
-    let mut body = Vec::with_capacity(1024);
-    let mut buf = [0u8; 512];
-    loop {
-        let n = conn.read(&mut buf).map_err(|e| format!("read: {e:?}"))?;
-        if n == 0 {
-            break;
-        }
-        if body.len() + n > CHECK_BODY_MAX {
-            return Err("response too large".into());
-        }
-        body.extend_from_slice(&buf[..n]);
-    }
-    serde_json::from_slice(&body).map_err(|e| format!("parse: {e:?}"))
+    // 版本 = Release 目标 commit 的短 SHA（CI 建草稿时写入 github.sha）；
+    // 只用 API 响应字段，不再下载 manifest.json（资产域名国内直连不稳）
+    Ok(short_sha(&release.target_commitish))
 }
 
 /// 触发固件升级（异步；下载完成后自动重启）。
@@ -325,19 +295,46 @@ pub fn start_upgrade() -> Result<(), String> {
 }
 
 fn upgrade_worker(url: String, latest: Option<String>) {
-    match download_and_flash(&url) {
-        Ok(()) => {
-            ::log::info!("OTA: image written & verified, rebooting into new firmware");
-            set_state("rebooting", latest, Some(100), None);
-            // 留一点时间让 HTTP 轮询拿到最终状态
-            std::thread::sleep(Duration::from_secs(2));
-            unsafe { esp_idf_svc::sys::esp_restart() };
-        }
-        Err(e) => {
-            ::log::error!("OTA: upgrade failed: {e}");
-            set_state("failed", latest, None, Some(e));
+    // 候选地址：镜像优先（国内直连 GitHub 资产域名不稳），失败回退直连
+    let mut candidates = Vec::new();
+    if !ac::OTA_MIRROR_PREFIX.is_empty() {
+        candidates.push(format!("{}{}", ac::OTA_MIRROR_PREFIX, url));
+    }
+    candidates.push(url.clone());
+
+    let mut last_err = String::from("download failed");
+    for (i, cand) in candidates.iter().enumerate() {
+        // 每个候选尝试 2 次
+        for attempt in 1..=2 {
+            ::log::info!(
+                "OTA: downloading ({}/{}) attempt {}: {}",
+                i + 1,
+                candidates.len(),
+                attempt,
+                cand
+            );
+            match download_and_flash(cand) {
+                Ok(()) => {
+                    ::log::info!("OTA: image written & verified, rebooting into new firmware");
+                    set_state("rebooting", latest, Some(100), None);
+                    // 留一点时间让 HTTP 轮询拿到最终状态
+                    std::thread::sleep(Duration::from_secs(2));
+                    unsafe { esp_idf_svc::sys::esp_restart() };
+                }
+                Err(e) => {
+                    ::log::warn!("OTA: download failed: {e}");
+                    last_err = e;
+                    // 失败后重置进度，等 2s 再试
+                    if let Ok(mut s) = status_cell().lock() {
+                        s.progress = Some(0);
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
         }
     }
+    ::log::error!("OTA: all download attempts failed: {last_err}");
+    set_state("failed", latest, None, Some(last_err));
 }
 
 fn download_and_flash(url: &str) -> Result<(), String> {

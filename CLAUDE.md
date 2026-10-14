@@ -273,8 +273,8 @@ WakeManager/
 
 - **版本注入**：build.rs 读环境变量 `WOL_VERSION`（CI 传 **commit 短 SHA** 如 `7087f95`，本地兜底 `"dev"`）→ `app_config::VERSION`；`/api/status` 的 `version` 字段暴露。tag 只是 Release 的发布载体，**不作为版本号**。
 - **状态机**（全局 Mutex，`/api/status` 的 `ota` 字段轮询）：`idle / checking / update_available / downloading / rebooting / failed`；检查与下载都在 32KB 栈的专属线程跑（TLS 握手栈开销大，不能在 httpd 线程），进行中拒绝重复触发。
-- **检查**：`GET /api/ota/check` → `releases/latest` API（必须带 User-Agent，否则 GitHub 403）→ 取 `wol-rs.bin` 资产 URL 与 `manifest.json` 资产 → 下载 manifest 读 `commit` 字段（短 SHA）与本机版本比对，**不同即视为有更新**（`dev` 构建视为总是落后）。
-- **升级**：`POST /api/ota` → `EspHttpConnection`（`crt_bundle_attach` 证书 bundle + 跟随 302 到 objects.githubusercontent.com）流式下载 → `EspOta::initiate_update_with_known_size`（按 Content-Length 只擦需用扇区）→ `update.write()` 分片写 → `complete()` 校验镜像并切换启动分区 → 2s 后 `esp_restart()`。
+- **检查**：`GET /api/ota/check` → `releases/latest` API（必须带 User-Agent，否则 GitHub 403）→ 从**API 响应字段**取版本：`target_commitish`（CI 建草稿时写入的 github.sha）截 7 位短 SHA 与本机比对，**不下载任何资产**（manifest.json 等资产域名国内直连不稳，检查必须只依赖 api.github.com）；取 `wol-rs.bin` 资产的 `browser_download_url` 留给升级用（`dev` 构建视为总是落后）。
+- **升级**：`POST /api/ota` → 下载地址依次尝试：`OTA_MIRROR_PREFIX` 镜像（默认 `https://ghfast.top/`，国内加速）→ 直连，各 2 次；`EspHttpConnection` 证书 bundle + **手动跟随 302**（esp_http_client 自动重定向跨主机有 "delayed connect error" 已知 bug，`http_get` 每跳新连接跟 Location）→ `EspOta::initiate_update_with_known_size`（按 Content-Length 只擦需用扇区）→ `update.write()` 分片写 → `complete()` 校验镜像并切换启动分区 → 2s 后 `esp_restart()`。
 - **分区表**：`partitions.csv` 为 OTA 双槽布局（otadata + ota_0/ota_1 各 0x3D0000）；**NVS 偏移（0x9000）与旧 factory 布局一致**，存量配置不受影响。老固件（factory 布局）无法通过 OTA 迁移，**首次需串口全量烧录新分区表**。
 - 无 rollback（未开 `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`）：`esp_ota_end` 校验失败会中止，不会切换启动分区。
 

@@ -277,7 +277,7 @@ jobs:
           fi
 
           # 校验草稿确实属于当前 tag，避免误发布
-          release_info=$(gh api repos/{owner}/{repo}/releases/"$release_id" --repo "$GITHUB_REPOSITORY" --jq '[.tag_name, .draft, (.assets | length), .html_url] | @tsv')
+          release_info=$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" --jq '[.tag_name, .draft, (.assets | length), .html_url] | @tsv')
           IFS=$'\t' read -r release_tag _ asset_count release_url <<< "$release_info"
 
           if [ "$release_tag" != "$TAG_NAME" ]; then
@@ -292,10 +292,9 @@ jobs:
 
           echo "Publishing release $release_id ($release_url) with $asset_count assets."
 
-          # --repo 显式指定仓库：{owner}/{repo} 占位符依赖 git 上下文展开，
-          # 本 job 未 checkout，不带会报 "not a git repository"
-          gh api --method PATCH repos/{owner}/{repo}/releases/"$release_id" \
-            --repo "$GITHUB_REPOSITORY" \
+          # 路径直接用 $GITHUB_REPOSITORY 拼接：{owner}/{repo} 占位符需要 git
+          # 上下文展开，而本 job 未 checkout；gh api 也没有 --repo 参数
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             -f name="WakeManager $TAG_NAME" \
             -F body=@release.txt \
             -F draft=false \
