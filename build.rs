@@ -9,7 +9,7 @@ fn main() {
     // 否则触发 unexpected_cfgs 警告
     println!("cargo:rustc-check-cfg=cfg(esp_idf_log_colors)");
 
-    // OTA 版本注入：CI 构建时导出 WOL_VERSION（tag 名或 git describe），
+    // OTA 版本注入：CI 构建时导出 WOL_VERSION（commit 短 SHA，如 7087f95），
     // 本地构建未设置时兜底 "dev"。app_config::VERSION 消费 env!("WOL_VERSION")。
     let version = env::var("WOL_VERSION").unwrap_or_else(|_| "dev".into());
     println!("cargo:rustc-env=WOL_VERSION={version}");

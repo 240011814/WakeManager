@@ -92,12 +92,8 @@ jobs:
         run: |
           . "$HOME/export-esp.sh"
           . "$HOME/.cargo/env"
-          # OTA 版本注入：tag 构建用 tag 名，分支构建用 git describe
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            export WOL_VERSION="$GITHUB_REF_NAME"
-          else
-            export WOL_VERSION="$(git describe --tags --always 2>/dev/null || echo "dev-${GITHUB_SHA::7}")"
-          fi
+          # 版本注入：统一用 commit 短 SHA（如 7087f95），不用 tag 名
+          export WOL_VERSION="${GITHUB_SHA::7}"
           echo "WOL_VERSION=$WOL_VERSION"
           chmod +x wokwi/mkwokwi.sh
           ./wokwi/mkwokwi.sh --real --release
@@ -203,11 +199,11 @@ jobs:
             echo "::error::No prepared release ID found for ${{ steps.prep.outputs.tag }}."
             exit 1
           fi
-          # manifest.json：版本 + 提交 + 各文件 sha256
+          # manifest.json：版本（commit 短 SHA）+ 提交 + 各文件 sha256
           (cd firmware-dist && sha256sum wol-rs.bin bootloader/bootloader.bin partition_table/partition-table.bin) > /tmp/sha.txt
           cat > firmware-dist/manifest.json << EOF
           {
-            "version": "${{ steps.prep.outputs.tag }}",
+            "version": "${GITHUB_SHA::7}",
             "commit": "${{ github.sha }}",
             "chip": "esp32s3",
             "sha256": {$(awk '{printf "    \"%s\": \"%s\",\n", $2, $1}' /tmp/sha.txt | sed '$ s/,$//')}

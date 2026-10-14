@@ -100,17 +100,25 @@ struct GhAsset {
     browser_download_url: String,
 }
 
-/// 规范化版本比较：去 'v' 前缀；本地 dev 构建视为总是落后
-fn norm_version(v: &str) -> &str {
-    v.trim().trim_start_matches('v')
+/// manifest.json（CI 上传的 Release 资产）：版本即 commit
+#[derive(Deserialize)]
+struct OtaManifest {
+    commit: String,
 }
 
+/// commit 短 SHA（7 位，与 CI 注入的 WOL_VERSION 格式一致）
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+/// 版本比对：短 SHA 不同即视为有更新（commit 顺序无法本地比较，
+/// "有差异就升级" 是最简单可靠的语义）；本地 dev 构建视为总是落后
 fn has_update(current: &str, latest: &str) -> bool {
-    let cur = norm_version(current);
+    let cur = current.trim();
     if cur == "dev" || cur.is_empty() {
         return true;
     }
-    cur != norm_version(latest)
+    cur != latest.trim()
 }
 
 /* ---------------- HTTP 基础 ---------------- */
@@ -214,7 +222,36 @@ fn do_check() -> Result<String, String> {
         *cell = Some(asset.browser_download_url.clone());
     }
 
-    Ok(release.tag_name)
+    // 版本取自 manifest.json 的 commit（tag 只是发布载体，不作为版本）
+    let manifest_url = release
+        .assets
+        .iter()
+        .find(|a| a.name == "manifest.json")
+        .map(|a| a.browser_download_url.clone())
+        .ok_or("release has no manifest.json")?;
+    let manifest: OtaManifest = fetch_json(&manifest_url)?;
+    Ok(short_sha(&manifest.commit))
+}
+
+/// GET 一个 JSON 资产并解析（manifest 通常 < 1KB）
+fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
+    let mut conn = http_get(url)?;
+    if conn.status() != 200 {
+        return Err(format!("fetch HTTP {}", conn.status()));
+    }
+    let mut body = Vec::with_capacity(1024);
+    let mut buf = [0u8; 512];
+    loop {
+        let n = conn.read(&mut buf).map_err(|e| format!("read: {e:?}"))?;
+        if n == 0 {
+            break;
+        }
+        if body.len() + n > CHECK_BODY_MAX {
+            return Err("response too large".into());
+        }
+        body.extend_from_slice(&buf[..n]);
+    }
+    serde_json::from_slice(&body).map_err(|e| format!("parse: {e:?}"))
 }
 
 /// 触发固件升级（异步；下载完成后自动重启）。
