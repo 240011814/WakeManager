@@ -153,7 +153,11 @@ fn http_get(uri: &str) -> Result<EspHttpConnection, String> {
                     .unwrap_or_default();
                 format!("{origin}{loc}")
             };
-            ::log::info!("OTA: following redirect to {}", current);
+            // 日志只打 scheme+host+path：签名 URL 的查询串（SAS+JWT）长达 1KB+，纯噪音
+            ::log::info!(
+                "OTA: following redirect to {}",
+                current.split('?').next().unwrap_or(&current)
+            );
             continue;
         }
         return Ok(conn);
@@ -163,7 +167,13 @@ fn http_get(uri: &str) -> Result<EspHttpConnection, String> {
 
 fn http_get_once(uri: &str) -> Result<EspHttpConnection, String> {
     let mut conn = EspHttpConnection::new(&HttpConfiguration {
+        // RX 缓冲（响应头 + 下载分片）
         buffer_size: Some(2048),
+        // TX 缓冲：请求行 "GET <path>?<query> HTTP/1.1\r\n" 必须整体放进该缓冲
+        // （esp_http_client http_client_prepare_first_line），放不下报
+        // "HTTP_CLIENT: Out of buffer"。GitHub 302 到 release-assets 的签名资产
+        // URL 查询串（SAS + JWT）约 1KB，请求行 >1.2KB，默认 512 必然爆。
+        buffer_size_tx: Some(4096),
         timeout: Some(Duration::from_secs(30)),
         // 重定向由 http_get 手动处理（自动重定向跨主机有已知 bug）
         follow_redirects_policy: FollowRedirectsPolicy::FollowNone,
@@ -258,7 +268,7 @@ fn do_check() -> Result<String, String> {
         .find(|a| a.name == ac::OTA_ASSET_NAME)
         .ok_or_else(|| format!("release {} has no asset {}", release.tag_name, ac::OTA_ASSET_NAME))?;
 
-    // 下载地址留给 start_upgrade（镜像前缀 + 直连两个候选，升级时依次尝试）
+    // 下载地址留给 start_upgrade（直连 browser_download_url，升级时重试 2 次）
     if let Ok(mut cell) = latest_url_cell().lock() {
         *cell = Some(asset.browser_download_url.clone());
     }
@@ -295,41 +305,26 @@ pub fn start_upgrade() -> Result<(), String> {
 }
 
 fn upgrade_worker(url: String, latest: Option<String>) {
-    // 候选地址：镜像优先（国内直连 GitHub 资产域名不稳），失败回退直连
-    let mut candidates = Vec::new();
-    if !ac::OTA_MIRROR_PREFIX.is_empty() {
-        candidates.push(format!("{}{}", ac::OTA_MIRROR_PREFIX, url));
-    }
-    candidates.push(url.clone());
-
     let mut last_err = String::from("download failed");
-    for (i, cand) in candidates.iter().enumerate() {
-        // 每个候选尝试 2 次
-        for attempt in 1..=2 {
-            ::log::info!(
-                "OTA: downloading ({}/{}) attempt {}: {}",
-                i + 1,
-                candidates.len(),
-                attempt,
-                cand
-            );
-            match download_and_flash(cand) {
-                Ok(()) => {
-                    ::log::info!("OTA: image written & verified, rebooting into new firmware");
-                    set_state("rebooting", latest, Some(100), None);
-                    // 留一点时间让 HTTP 轮询拿到最终状态
-                    std::thread::sleep(Duration::from_secs(2));
-                    unsafe { esp_idf_svc::sys::esp_restart() };
+    // 直连下载，尝试 2 次
+    for attempt in 1..=2 {
+        ::log::info!("OTA: downloading attempt {attempt}: {url}");
+        match download_and_flash(&url) {
+            Ok(()) => {
+                ::log::info!("OTA: image written & verified, rebooting into new firmware");
+                set_state("rebooting", latest, Some(100), None);
+                // 留一点时间让 HTTP 轮询拿到最终状态
+                std::thread::sleep(Duration::from_secs(2));
+                unsafe { esp_idf_svc::sys::esp_restart() };
+            }
+            Err(e) => {
+                ::log::warn!("OTA: download failed: {e}");
+                last_err = e;
+                // 失败后重置进度，等 2s 再试
+                if let Ok(mut s) = status_cell().lock() {
+                    s.progress = Some(0);
                 }
-                Err(e) => {
-                    ::log::warn!("OTA: download failed: {e}");
-                    last_err = e;
-                    // 失败后重置进度，等 2s 再试
-                    if let Ok(mut s) = status_cell().lock() {
-                        s.progress = Some(0);
-                    }
-                    std::thread::sleep(Duration::from_secs(2));
-                }
+                std::thread::sleep(Duration::from_secs(2));
             }
         }
     }

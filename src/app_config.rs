@@ -59,11 +59,7 @@ pub const VERSION: &str = env!("WOL_VERSION");
 pub const OTA_ASSET_NAME: &str = "wol-rs.bin";
 /// 版本检查 API（GitHub releases/latest；仓库写死于此常量）
 pub const OTA_CHECK_URL: &str = "https://api.github.com/repos/240011814/WakeManager/releases/latest";
-/// GitHub 资产下载加速镜像前缀（国内直连 github.com/objects.githubusercontent.com
-/// 不稳定）。拼接规则：`{镜像}{原始下载URL}`，例如
-/// `https://ghfast.top/https://github.com/.../wol-rs.bin`。
-/// 下载时镜像失败自动回退直连；填空字符串 "" 则只用直连。
-pub const OTA_MIRROR_PREFIX: &str = "https://ghfast.top/";
+
 
 /* ---------- Address book ---------- */
 
