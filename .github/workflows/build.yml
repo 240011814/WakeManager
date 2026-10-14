@@ -1,0 +1,282 @@
+name: Build Firmware
+
+# 触发：push main / 打 tag(v*) / 手动
+on:
+  push:
+    branches: [rust]
+    tags: ['v*']
+  workflow_dispatch:
+
+# 推送固件分支、创建 Release 需要写权限
+permissions:
+  contents: write
+
+# 同一 ref 的并发构建只保留最新的
+concurrency:
+  group: build-firmware-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 打 tag 时先创建草稿 Release，拿到 release_id 交给构建 job 上传产物；
+  # 全部产物上传完成后由 publish_release 统一公开，避免半成品 Release 暴露
+  prepare_release:
+    name: 创建草稿 Release (tag only)
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create_draft.outputs.id }}
+    steps:
+      - name: Create or update draft release
+        id: create_draft
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: 'WakeManager ${{ github.ref_name }}'
+          body: 'Draft release, will be updated after all artifacts are uploaded.'
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: true
+
+  build:
+    name: 构建 ESP32-S3 固件
+    needs: [prepare_release]
+    # prepare_release 因非 tag 跳过时，build 照常执行（push main / 手动）
+    if: always() && needs.prepare_release.result != 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git wget libssl-dev libudev-dev pkg-config \
+            python3 python3-pip python3-venv \
+            cmake ninja-build ccache flex bison gperf
+
+      # 缓存 Xtensa 工具链（espup）+ ESP-IDF 工具 + cargo registry + target，
+      # 命中缓存可把 10~20 分钟的首次构建压到几分钟
+      - name: 缓存工具链与构建目录
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.espressif
+            ~/.rustup/toolchains/esp
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: fw-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'sdkconfig.defaults', 'partitions.csv', 'Cargo.toml') }}
+          restore-keys: |
+            fw-${{ runner.os }}-
+
+      - name: 安装 Xtensa Rust 工具链 (espup)
+        run: |
+          cargo install espup --locked
+          espup install --targets esp32s3 --toolchain-version esp
+          # espup 未安装过时才会生成；缺失则兜底写一个
+          [ -f "$HOME/export-esp.sh" ] || echo 'export LIBCLANG_PATH="$HOME/.espressif/llvm-xtensa/lib"' > "$HOME/export-esp.sh"
+
+      - name: 安装 ldproxy
+        run: |
+          . "$HOME/export-esp.sh"
+          . "$HOME/.cargo/env"
+          command -v ldproxy >/dev/null || cargo install ldproxy --locked
+
+      - name: 构建 release 固件并组装烧录镜像
+        run: |
+          . "$HOME/export-esp.sh"
+          . "$HOME/.cargo/env"
+          chmod +x wokwi/mkwokwi.sh
+          ./wokwi/mkwokwi.sh --real --release
+
+      - name: 整理产物
+        id: prep
+        run: |
+          set -euo pipefail
+          STAGE=firmware-dist
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -r build/. "$STAGE/"
+          # sha256 校验和（便于核对下载完整性）
+          (cd "$STAGE" && sha256sum $(find . -type f | sort) > SHA256SUMS)
+          # 版本标记
+          echo "commit=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          ls -lhR "$STAGE"
+
+      # 产物推送到独立分支 rust（孤儿分支，不参与主线历史）：
+      #   rust/latest/            每次构建覆盖
+      #   rust/releases/<tag>/    打 tag 时归档
+      #   rust/README.md          下载索引
+      - name: 推送产物到 rust 分支
+        run: |
+          set -euo pipefail
+          BRANCH=rust
+          STAGE=firmware-dist
+          ARCH=$RUNNER_TEMP/fw-archive
+          WORK=$RUNNER_TEMP/fw-branch
+          REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          rm -rf "$ARCH" "$WORK"
+          mkdir -p "$WORK"
+
+          # 先抢救现有 rust 分支上的 tag 归档（releases/），孤儿提交会丢历史
+          if git ls-remote --exit-code --heads "$REPO_URL" "$BRANCH" >/dev/null 2>&1; then
+            git clone --depth 1 --branch "$BRANCH" --single-branch "$REPO_URL" "$ARCH" -q || true
+            [ -d "$ARCH/releases" ] && cp -r "$ARCH/releases" "$WORK/releases" || true
+          fi
+
+          cd "$WORK"
+
+          # 孤儿提交：每次构建都是全新的单提交历史（--force 推送），
+          # 分支体积恒定，不随构建次数膨胀
+          git init --initial-branch="$BRANCH" -q
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # latest/ 每次覆盖；tag 时额外归档一份
+          mkdir -p latest
+          cp -r "$GITHUB_WORKSPACE/$STAGE/." latest/
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            mkdir -p "releases/${{ steps.prep.outputs.tag }}"
+            cp -r "$GITHUB_WORKSPACE/$STAGE/." "releases/${{ steps.prep.outputs.tag }}/"
+          fi
+
+          # 生成 README 下载索引（仿 Release list）
+          {
+            echo "# WakeManager 固件下载"
+            echo
+            echo "> 本分支由 GitHub Actions 自动维护，仅存放构建产物，请勿手动提交。"
+            echo
+            echo "## 最新构建 (main @ ${{ steps.prep.outputs.commit }})"
+            echo
+            echo "烧录：\`esptool.py --chip esp32s3 write_flash 0x0 bootloader/bootloader.bin 0x8000 partition_table/partition-table.bin 0x10000 wol-rs.bin\`"
+            echo
+            echo "| 文件 | 下载 |"
+            echo "| --- | --- |"
+            for f in wol-rs.bin wol-rs.elf bootloader/bootloader.bin partition_table/partition-table.bin flasher_args.json SHA256SUMS; do
+              echo "| \`$f\` | [下载](latest/$f) |"
+            done
+            if [ -d releases ]; then
+              echo
+              echo "## 版本归档"
+              echo
+              echo "| 版本 | 目录 | GitHub Release |"
+              echo "| --- | --- | --- |"
+              for d in $(ls -1 releases | sort -Vr); do
+                echo "| $d | [releases/$d](releases/$d) | [Release 页面](../../releases/tag/$d) |"
+              done
+            fi
+          } > README.md
+
+          git add -A
+          git commit -q -m "build: ${{ steps.prep.outputs.tag }} (${{ steps.prep.outputs.commit }}) [skip ci]"
+          git remote add origin "$REPO_URL"
+          # 覆盖式推送：latest/ 目录每次全量替换，避免历史膨胀
+          git push --force origin "$BRANCH"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 打 tag 时把完整镜像 zip 上传到 prepare_release 创建的草稿 Release
+      # （--clobber 支持重跑覆盖；此时尚未公开）
+      - name: 上传产物到草稿 Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.prepare_release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RELEASE_ID" ]; then
+            echo "::error::No prepared release ID found for ${{ steps.prep.outputs.tag }}."
+            exit 1
+          fi
+          cd firmware-dist
+          zip -r "../wol-rs-${{ steps.prep.outputs.tag }}.zip" .
+          cd ..
+          gh release upload "${{ steps.prep.outputs.tag }}" \
+            "wol-rs-${{ steps.prep.outputs.tag }}.zip" \
+            --clobber
+
+      - name: 上传 Actions 构件（备份）
+        uses: actions/upload-artifact@v4
+        with:
+          name: wol-rs-${{ steps.prep.outputs.tag }}
+          path: firmware-dist/
+          if-no-files-found: error
+
+  # 全部产物上传完成后，写入正式 release body 并把草稿改为公开
+  publish_release:
+    name: 发布 Release (tag only)
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [prepare_release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Env
+        run: |
+          echo "BUILDTIME=$(TZ=Asia/Shanghai date)" >> "$GITHUB_ENV"
+          echo "TAG_NAME=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "DOWNLOAD_URL=https://github.com/${GITHUB_REPOSITORY}/releases/download/$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+
+      - name: Generate release body
+        run: |
+          cat > release.txt << EOF
+          ESP32-S3 网络唤醒控制器固件（Rust / ESP-IDF v6.1），commit ${GITHUB_SHA::7}。
+
+          ## 下载
+
+          - [完整烧录镜像 zip](${{ env.DOWNLOAD_URL }}/wol-rs-${{ env.TAG_NAME }}.zip)（bootloader + 分区表 + 固件，解压后用下方命令烧录）
+
+          ## 烧录
+
+          \`\`\`bash
+          esptool.py --chip esp32s3 write_flash \\
+            0x0 bootloader/bootloader.bin \\
+            0x8000 partition_table/partition-table.bin \\
+            0x10000 wol-rs.bin
+          \`\`\`
+
+          或使用 cargo-espflash：\`cargo espflash flash --monitor\`（需在源码 checkout 下对应 tag 构建）。
+
+          校验和见 zip 内 \`SHA256SUMS\`。
+
+          Created at ${{ env.BUILDTIME }}.
+          EOF
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_id="${{ needs.prepare_release.outputs.release_id }}"
+
+          if [ -z "$release_id" ]; then
+            echo "::error::No prepared release ID found for $TAG_NAME."
+            exit 1
+          fi
+
+          # 校验草稿确实属于当前 tag，避免误发布
+          release_info=$(gh api repos/{owner}/{repo}/releases/"$release_id" --jq '[.tag_name, .draft, (.assets | length), .html_url] | @tsv')
+          IFS=$'\t' read -r release_tag _ asset_count release_url <<< "$release_info"
+
+          if [ "$release_tag" != "$TAG_NAME" ]; then
+            echo "::error::Prepared release $release_id belongs to $release_tag, expected $TAG_NAME."
+            exit 1
+          fi
+
+          if [ "$asset_count" -eq 0 ]; then
+            echo "::error::Release $TAG_NAME has no assets, refusing to publish."
+            exit 1
+          fi
+
+          echo "Publishing release $release_id ($release_url) with $asset_count assets."
+
+          gh api --method PATCH repos/{owner}/{repo}/releases/"$release_id" \
+            -f name="WakeManager $TAG_NAME" \
+            -F body=@release.txt \
+            -F draft=false \
+            --silent

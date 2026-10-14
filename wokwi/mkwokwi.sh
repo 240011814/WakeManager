@@ -5,10 +5,11 @@
 #   wol-rs.bin                     ← cargo 链接的固件 elf 经 esptool elf2image 转换
 #
 # 用法（仓库根或 wokwi/ 目录均可）：
-#   ./wokwi/mkwokwi.sh             # sim 固件（--features sim）→ wokwi/build/，供 wokwi-cli 消费
-#   ./wokwi/mkwokwi.sh --real      # 真机固件（默认 features）→ 仓库根 build/，
-#                                  #   供 ESP-IDF 插件的 Flash 按钮消费
-#                                  #   （idf.buildPath 默认 "build"，只认 <build>/flasher_args.json）
+#   ./wokwi/mkwokwi.sh                 # sim 固件（--features sim）→ wokwi/build/，供 wokwi-cli 消费
+#   ./wokwi/mkwokwi.sh --real          # 真机固件（默认 features）→ 仓库根 build/，
+#                                      #   供 ESP-IDF 插件的 Flash 按钮消费
+#                                      #   （idf.buildPath 默认 "build"，只认 <build>/flasher_args.json）
+#   ./wokwi/mkwokwi.sh --real --release # 真机 release 固件（CI 发布用）
 # 注意：sim / real 两种构建共用同一个 elf 路径，脚本必须自己触发对应特征的构建，
 # 否则会拿到上一次另一种特征的固件（sim 在真机上会直连 Wokwi-GUEST、卡在配网）。
 set -euo pipefail
@@ -17,16 +18,30 @@ WOKWI_DIR="$(cd "$(dirname "$0")" && pwd)"     # <repo>/wokwi
 REPO_ROOT="$(dirname "$WOKWI_DIR")"            # cargo 工程根
 cd "$WOKWI_DIR"
 
-if [ "${1:-}" = "--real" ]; then
-    FEATURES_ARG=""                            # 真机：默认 features
-    OUT_DIR="$REPO_ROOT/build"
-else
-    FEATURES_ARG="--features sim"              # 模拟：跳过 BLE 配网
-    OUT_DIR="$WOKWI_DIR/build"
-fi
+PROFILE=debug
+RELEASE_FLAG=""
+FEATURES_ARG="--features sim"                  # 模拟：跳过 BLE 配网
+OUT_DIR="$WOKWI_DIR/build"
+for arg in "$@"; do
+    case "$arg" in
+        --real)
+            FEATURES_ARG=""                    # 真机：默认 features
+            OUT_DIR="$REPO_ROOT/build"
+            ;;
+        --release)
+            PROFILE="release"
+            RELEASE_FLAG="--release"
+            ;;
+        -h|--help)
+            sed -n '2,12p' "$0"; exit 0
+            ;;
+        *)
+            echo "unknown option: $arg (see --help)" >&2; exit 1
+            ;;
+    esac
+done
 
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
-PROFILE=debug
 ELF="$TARGET_DIR/xtensa-esp32s3-espidf/$PROFILE/wol-rs"
 
 # cargo 需在工程根执行（wokwi/ 是子目录，cargo 也能向上找到 Cargo.toml，但显式更稳）
@@ -39,10 +54,10 @@ unset IDF_PATH
 
 LOG="$REPO_ROOT/.mkwokwi.log"
 {
-    echo "=== $(date '+%F %T')  cmd=cargo build $FEATURES_ARG  (cwd=$REPO_ROOT)"
+    echo "=== $(date '+%F %T')  cmd=cargo build $RELEASE_FLAG $FEATURES_ARG  (cwd=$REPO_ROOT)"
     env | grep -E '^(IDF|ESP|CARGO|MCU)' | sort | sed 's/^/    env: /'
 } >> "$LOG"
-if ! (cd "$REPO_ROOT" && cargo build $FEATURES_ARG) >> "$LOG" 2>&1; then
+if ! (cd "$REPO_ROOT" && cargo build $RELEASE_FLAG $FEATURES_ARG) >> "$LOG" 2>&1; then
     echo "cargo build 失败！完整日志: $LOG" >&2
     tail -30 "$LOG" >&2
     exit 1
@@ -135,7 +150,7 @@ cat > "$OUT_DIR/project_description.json" <<EOF
   "bootloader_elf": "bootloader/bootloader.elf",
   "app_elf": "wol-rs.elf",
   "app_bin": "wol-rs.bin",
-  "build_type": "debug",
+  "build_type": "$PROFILE",
   "version": "v6.1",
   "config_environment": {}
 }
