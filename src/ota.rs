@@ -29,6 +29,17 @@ const OTA_THREAD_STACK: usize = 32 * 1024;
 const DL_BUF_SIZE: usize = 4096;
 /// 版本检查响应体上限（releases/latest JSON 通常 < 8KB，防跑飞）
 const CHECK_BODY_MAX: usize = 32 * 1024;
+/// 每个下载候选的尝试次数：直连 github.com 的 TCP 连接在国内网络下常被
+/// 中间设备中止（ESP_ERR_HTTP_CONNECT），单次失败不代表下次失败，多试几次
+const DL_ATTEMPTS: u32 = 2;
+/// 尝试间退避基数（秒），实际 2^attempt：2/4/8s。esp-tls 只用 getaddrinfo
+/// 的首个解析结果且 lwIP 有 DNS 缓存，拉开间隔让 TTL 过期重新解析，
+/// 避免连续重试都撞同一个不可达 IP
+const DL_BACKOFF_BASE: u64 = 2;
+/// GitHub API 元数据的 Accept
+const ACCEPT_GH_JSON: &str = "application/vnd.github+json";
+/// 资产下载的 Accept：API 资产端点据此 302 到 CDN 二进制流
+const ACCEPT_OCTET: &str = "application/octet-stream";
 
 /* ---------------- 状态机 ---------------- */
 
@@ -63,10 +74,10 @@ fn status_cell() -> &'static Mutex<OtaStatus> {
     CELL.get_or_init(|| Mutex::new(OtaStatus::new()))
 }
 
-/// check() 找到的最新固件下载地址（供 start_upgrade 使用）
-fn latest_url_cell() -> &'static Mutex<Option<String>> {
-    static CELL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    CELL.get_or_init(|| Mutex::new(None))
+/// check() 找到的最新固件下载地址候选（供 start_upgrade 按序尝试）
+fn latest_urls_cell() -> &'static Mutex<Vec<String>> {
+    static CELL: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 pub fn status() -> OtaStatus {
@@ -100,6 +111,12 @@ struct GhRelease {
 #[derive(Deserialize)]
 struct GhAsset {
     name: String,
+    /// GitHub API 资产端点（api.github.com/repos/.../releases/assets/{id}）：
+    /// 下载首选——带 Accept: application/octet-stream 时 302 到 CDN 签名 URL，
+    /// 绕开国内连不稳的 github.com
+    url: String,
+    /// 资产直链（github.com/.../releases/download/...）：后备，
+    /// 国内 TCP 连接常被中间设备中止
     browser_download_url: String,
 }
 
@@ -127,10 +144,10 @@ fn has_update(current: &str, latest: &str) -> bool {
 /// 跨主机时有 "delayed connect error: Software caused connection abort"
 /// 的已知问题（旧 socket 未干净关闭就开新连接）→ 这里关掉自动重定向，
 /// 每一跳用全新连接手动跟 Location。
-fn http_get(uri: &str) -> Result<EspHttpConnection, String> {
+fn http_get(uri: &str, accept: &str) -> Result<EspHttpConnection, String> {
     let mut current = uri.to_string();
     for _ in 0..5 {
-        let conn = http_get_once(&current)?;
+        let conn = http_get_once(&current, accept)?;
         let status = conn.status();
         if (300..400).contains(&status) {
             let location = conn.header("Location").map(|s| s.to_string());
@@ -165,7 +182,7 @@ fn http_get(uri: &str) -> Result<EspHttpConnection, String> {
     Err("too many redirects".into())
 }
 
-fn http_get_once(uri: &str) -> Result<EspHttpConnection, String> {
+fn http_get_once(uri: &str, accept: &str) -> Result<EspHttpConnection, String> {
     let mut conn = EspHttpConnection::new(&HttpConfiguration {
         // RX 缓冲（响应头 + 下载分片）
         buffer_size: Some(2048),
@@ -174,7 +191,10 @@ fn http_get_once(uri: &str) -> Result<EspHttpConnection, String> {
         // "HTTP_CLIENT: Out of buffer"。GitHub 302 到 release-assets 的签名资产
         // URL 查询串（SAS + JWT）约 1KB，请求行 >1.2KB，默认 512 必然爆。
         buffer_size_tx: Some(4096),
-        timeout: Some(Duration::from_secs(30)),
+        // 单次超时（connect/TLS 握手/每次 read 共用）：设短一点让失败的连接
+        // 尽快释放去下一轮重试（国内直连 github.com 被中止一般 18s 内见分晓）；
+        // 下载是流式 4KB 分片，read 停滞 20s 也基本等于连接已死
+        timeout: Some(Duration::from_secs(20)),
         // 重定向由 http_get 手动处理（自动重定向跨主机有已知 bug）
         follow_redirects_policy: FollowRedirectsPolicy::FollowNone,
         crt_bundle_attach: Some(esp_crt_bundle_attach),
@@ -188,7 +208,8 @@ fn http_get_once(uri: &str) -> Result<EspHttpConnection, String> {
         &[
             // GitHub API 强制要求 User-Agent，缺了返回 403
             ("User-Agent", "WakeManager-OTA"),
-            ("Accept", "application/vnd.github+json"),
+            // API 元数据用 json；资产下载用 octet-stream（API 资产端点据此 302 到 CDN）
+            ("Accept", accept),
         ],
     )
     .map_err(|e| format!("request: {e:?}"))?;
@@ -236,7 +257,7 @@ fn check_worker() {
 }
 
 fn do_check() -> Result<String, String> {
-    let mut conn = http_get(ac::OTA_CHECK_URL)?;
+    let mut conn = http_get(ac::OTA_CHECK_URL, ACCEPT_GH_JSON)?;
     // GitHub 在仓库没有任何已发布 Release 时对 latest 接口返回 404
     if conn.status() == 404 {
         return Err("服务器上还没有已发布的版本".into());
@@ -268,9 +289,12 @@ fn do_check() -> Result<String, String> {
         .find(|a| a.name == ac::OTA_ASSET_NAME)
         .ok_or_else(|| format!("release {} has no asset {}", release.tag_name, ac::OTA_ASSET_NAME))?;
 
-    // 下载地址留给 start_upgrade（直连 browser_download_url，升级时重试 2 次）
-    if let Ok(mut cell) = latest_url_cell().lock() {
-        *cell = Some(asset.browser_download_url.clone());
+    // 下载地址候选留给 start_upgrade（按序各重试 DL_ATTEMPTS 次）：
+    // ① API 资产端点（api.github.com，国内解析通常可达，octet-stream 302 到 CDN）；
+    // ② 资产直链（github.com，国内 TCP 常被中止）仅作后备
+    let candidates = vec![asset.url.clone(), asset.browser_download_url.clone()];
+    if let Ok(mut cell) = latest_urls_cell().lock() {
+        *cell = candidates;
     }
 
     // 版本 = Release 目标 commit 的短 SHA（CI 建草稿时写入 github.sha）；
@@ -289,42 +313,51 @@ pub fn start_upgrade() -> Result<(), String> {
         "update_available" => {}
         _ => return Err("请先检查更新".into()),
     }
-    let url = latest_url_cell()
+    let urls = latest_urls_cell()
         .lock()
         .ok()
-        .and_then(|c| c.clone())
+        .map(|c| c.clone())
+        .filter(|c| !c.is_empty())
         .ok_or("缺少下载地址，请重新检查更新")?;
 
     set_state("downloading", latest.clone(), Some(0), None);
     std::thread::Builder::new()
         .name("ota_upgrade".into())
         .stack_size(OTA_THREAD_STACK)
-        .spawn(move || upgrade_worker(url, latest))
+        .spawn(move || upgrade_worker(urls, latest))
         .map_err(|e| format!("spawn: {e:?}"))?;
     Ok(())
 }
 
-fn upgrade_worker(url: String, latest: Option<String>) {
+fn upgrade_worker(urls: Vec<String>, latest: Option<String>) {
     let mut last_err = String::from("download failed");
-    // 直连下载，尝试 2 次
-    for attempt in 1..=2 {
-        ::log::info!("OTA: downloading attempt {attempt}: {url}");
-        match download_and_flash(&url) {
-            Ok(()) => {
-                ::log::info!("OTA: image written & verified, rebooting into new firmware");
-                set_state("rebooting", latest, Some(100), None);
-                // 留一点时间让 HTTP 轮询拿到最终状态
-                std::thread::sleep(Duration::from_secs(2));
-                unsafe { esp_idf_svc::sys::esp_restart() };
-            }
-            Err(e) => {
-                ::log::warn!("OTA: download failed: {e}");
-                last_err = e;
-                // 失败后重置进度，等 2s 再试
-                if let Ok(mut s) = status_cell().lock() {
-                    s.progress = Some(0);
+    // 逐候选下载（每个候选失败退避重试 DL_ATTEMPTS 次），候选顺序见 do_check
+    for (i, url) in urls.iter().enumerate() {
+        for attempt in 1..=DL_ATTEMPTS {
+            ::log::info!(
+                "OTA: downloading ({}/{}) attempt {attempt}/{DL_ATTEMPTS}: {url}",
+                i + 1,
+                urls.len()
+            );
+            match download_and_flash(url) {
+                Ok(()) => {
+                    ::log::info!("OTA: image written & verified, rebooting into new firmware");
+                    set_state("rebooting", latest, Some(100), None);
+                    // 留一点时间让 HTTP 轮询拿到最终状态
+                    std::thread::sleep(Duration::from_secs(2));
+                    unsafe { esp_idf_svc::sys::esp_restart() };
                 }
-                std::thread::sleep(Duration::from_secs(2));
+                Err(e) => {
+                    ::log::warn!("OTA: download failed: {e}");
+                    last_err = e;
+                    // 失败后重置进度，退避后再试（该候选最后一轮不再等）
+                    if let Ok(mut s) = status_cell().lock() {
+                        s.progress = Some(0);
+                    }
+                    if attempt < DL_ATTEMPTS {
+                        std::thread::sleep(Duration::from_secs(DL_BACKOFF_BASE.pow(attempt)));
+                    }
+                }
             }
         }
     }
@@ -333,7 +366,8 @@ fn upgrade_worker(url: String, latest: Option<String>) {
 }
 
 fn download_and_flash(url: &str) -> Result<(), String> {
-    let mut conn = http_get(url)?;
+    // Accept: application/octet-stream —— API 资产端点据此返回 302 到 CDN
+    let mut conn = http_get(url, ACCEPT_OCTET)?;
     if conn.status() != 200 {
         return Err(format!("download HTTP {}", conn.status()));
     }
