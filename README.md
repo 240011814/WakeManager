@@ -75,7 +75,8 @@ cargo espflash flash --monitor                 # 自定义分区表已编进构�
 | 命令 | 别名 | 作用 |
 | --- | --- | --- |
 | `help` | `cmd` / `menu` / `?` | 返回命令菜单 |
-| `status` | `st` | 设备状态文本（与 `/api/status` 同一份数据）：id/ip/ssid/rssi/heap/mqtt/broadcast/macs/temp/time |
+| `status` | `st` | 设备状态文本（与 `/api/status` 同一份数据）：id/ip/ssid/rssi/heap/mqtt/broadcast/macs/presence/temp/time |
+| `csi` | — | CSI 近场感知实时量：state（calibrating/absent/present）/baseline/amp/std/drop/rssi/frames；`csi recal` 强制重新校准基线 |
 | `wifi-clear` | `reset-wifi` | 清除 NVS 里的 Wi-Fi 配置（SSID/密码）→ 回复确认 → 300ms 后重启 → 开机检测到未配网，自动重新进入 BLE 配网（App 扫日志里的 QR / PoP）。**破坏性操作，设备需重新配网才能联网** |
 
 示例（在串口终端里发 `help` / `status`）：
@@ -85,6 +86,7 @@ cargo espflash flash --monitor                 # 自定义分区表已编进构�
 ==== WakeManager 串口命令 ====
 help         显示本菜单
 status       查看设备状态
+csi          查看 CSI 近场感知状态（csi recal 重新校准基线）
 wifi-clear   清除 Wi-Fi 配置并重新进入配网模式（设备将重启）
 
 > status
@@ -216,9 +218,10 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
     ├── watchdog.rs         # TWDT（esp_task_wdt FFI）
     ├── led_status.rs       # GPIO48 + 独立线程（PinDriver，Condvar 事件驱动）
     ├── debug_uart.rs       # UART1 → GPIO43/44 命令口（拼行，见「串口命令」）
-    ├── serial_cmd.rs       # 串口命令分发（help / status / wifi-clear）
+    ├── serial_cmd.rs       # 串口命令分发（help / status / csi / wifi-clear）
     ├── wifi_prov.rs        # BLE 配网（network_provisioning FFI；sim feature 直连 Wokwi-GUEST）
     ├── index.html          # 内嵌单页 Web UI（原 components/wol_http/index.html）
     ├── control_http.rs     # EspHttpServer（index.html include_str 内嵌）
-    └── control_mqtt.rs     # EspMqttClient::new + 事件循环线程 + API 工作线程
+    ├── control_mqtt.rs     # EspMqttClient::new + 事件循环线程 + API 工作线程
+    └── csi_presence.rs     # Wi-Fi CSI 近场人体感知（~1m 有人/无人，状态变化发 MQTT 通知）
 ```

@@ -6,6 +6,7 @@
 //! 命令集（先支持两个需求）：
 //!   help        命令菜单
 //!   status      设备状态查看
+//!   csi         CSI 近场感知状态查看（csi recal 重新校准基线）
 //!   wifi-clear  清除 Wi-Fi 配置（SSID/密码）→ 重启 → 开机自动进 BLE 配网
 //!
 //! 扩展方式：在 `handle()` 的 match 里加分支 + 菜单里加一行即可。
@@ -20,6 +21,7 @@ const MENU: &str = "\
 ==== WakeManager 串口命令 ====
 help         显示本菜单
 status       查看设备状态
+csi          查看 CSI 近场感知状态（csi recal 重新校准基线）
 wifi-clear   清除 Wi-Fi 配置并重新进入配网模式，完成后设备将重启";
 
 /// 回写一行到串口（自动补 CRLF 并等 TX 排空，下一条响应不会插队）
@@ -35,6 +37,11 @@ pub fn handle(driver: &mut UartDriver<'static>, line: &str) {
     match line {
         "help" | "cmd" | "menu" | "?" => write_line(driver, MENU),
         "status" | "st" => write_line(driver, &status_text()),
+        "csi" => write_line(driver, &crate::csi_presence::snapshot_text()),
+        "csi recal" => {
+            crate::csi_presence::recalibrate();
+            write_line(driver, "CSI 基线重新校准中（收够帧数后按现场无人重建基线）...");
+        }
         "wifi-clear" | "reset-wifi" => wifi_clear(driver),
         other => write_line(driver, &format!("未知命令: {other}\r\n\r\n{MENU}")),
     }
@@ -57,7 +64,7 @@ fn status_text() -> String {
     let boot = s.boot_time.unwrap_or_else(|| "n/a".to_string());
     format!(
         "id={}\r\nversion={}\r\nip={}\r\nssid={}\r\nrssi={}\r\nheap={} B\r\nmqtt={}\r\n\
-         broadcast={}\r\nmacs={}\r\ntemp={}\r\ntime={}\r\nboot={}",
+         broadcast={}\r\nmacs={}\r\npresence={}\r\ntemp={}\r\ntime={}\r\nboot={}",
         s.id,
         s.version,
         s.ip,
@@ -67,6 +74,7 @@ fn status_text() -> String {
         if s.mqtt_connected { "up" } else { "down" },
         s.broadcast,
         s.mac_count,
+        s.presence,
         temp,
         time,
         boot,

@@ -48,6 +48,7 @@
       <div class="k">信号</div><div id="st_rssi">-</div>
       <div class="k">空闲堆</div><div id="st_heap">-</div>
       <div class="k">MQTT</div><div id="st_mqtt">-</div>
+      <div class="k">近场感知（1m）</div><div id="st_presence">-</div>
       <div class="k">芯片温度</div><div id="st_temp">-</div>
       <div class="k">时间</div><div id="st_time">-</div>
       <div class="k">广播地址</div><div id="st_bcast">-</div>
@@ -121,6 +122,8 @@ function setMsg(el, text, ok) {
   el.className = 'msg ' + (ok ? 'ok' : 'err');
 }
 
+const PRESENCE_TEXT = { present: '有人', absent: '无人', calibrating: '校准中' };
+
 async function refreshStatus() {
   try {
     const s = await (await fetch('/api/status')).json();
@@ -132,6 +135,7 @@ async function refreshStatus() {
     $('st_mqtt').innerHTML = s.mqtt_connected
       ? '<span class="badge on">已连接</span>'
       : '<span class="badge off">未连接</span>';
+    $('st_presence').textContent = PRESENCE_TEXT[s.presence] || s.presence || '-';
     $('st_temp').textContent = (typeof s.temp_c === 'number')
       ? s.temp_c.toFixed(2) + ' °C' : '-';
     $('st_time').textContent = s.time || '(未同步)';

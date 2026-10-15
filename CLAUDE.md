@@ -92,6 +92,7 @@
 - **运行时配置**：所有参数经 NVS 持久化，可在网页上修改。
 - **设备唯一标识**：由 Wi-Fi STA MAC 生成 12 位十六进制 ID，用于 MQTT 寻址与发现。
 - **设备发现**：所有设备订阅同一个广播主题，远程无需预先知道设备 ID 即可先发现再操作。
+- **近场人体感知**：Wi-Fi CSI 近场遮挡近似探测 ~1 米内是否有人，状态变化时发 MQTT 通知（`csi/notify`）。
 - **BLE 配网**：基于 `espressif/network_provisioning`。
 
 技术栈：**Rust（`esp-idf-svc` std 路线 / ESP-IDF v6.1）**，目标芯片 **ESP32-S3**。原 C 实现已移除。
@@ -162,7 +163,8 @@ WakeManager/
     ├── wifi_prov.rs            # BLE 配网（network_provisioning FFI；sim 直连 Wokwi-GUEST）
     ├── ota.rs                  # OTA：GitHub Releases 版本检查 + 流式下载升级（esp_ota 双槽）
     ├── control_http.rs         # EspHttpServer（专属线程持有）+ 内嵌 index.html
-    └── control_mqtt.rs         # EspMqttClient + 事件循环线程 + API 工作线程
+    ├── control_mqtt.rs         # EspMqttClient + 事件循环线程 + API 工作线程
+    └── csi_presence.rs         # Wi-Fi CSI 近场人体感知（~1m 有人/无人，状态变化发 MQTT 通知）
 ```
 
 托管组件（由 `Cargo.toml` 的 `extra_components` 声明）：`espressif/mqtt`、`espressif/network_provisioning`（后者还依赖 `espressif/json_generator`）。
@@ -211,6 +213,18 @@ WakeManager/
 - **广播地址自动推导**：`directed broadcast = (ip & netmask) | ~netmask`，用 STA 网卡 IP 与掩码计算，支持任意前缀长度；网卡无 IP 时回退 `255.255.255.255`。
 - API：`wol::send_to(mac, dest_ip)`、`send_str_to(mac_str, dest_ip)`、`get_default_broadcast()`。
 
+## Wi-Fi CSI 近场人体感知（csi_presence）
+
+`csi_presence.rs`（需 sdkconfig `CONFIG_ESP_WIFI_CSI_ENABLED=y`，已在 sdkconfig.defaults 开启）：探测 **~1 米内是否有人**，状态变化时发 MQTT 通知。
+
+- **原理（近场遮挡近似，非精确测距）**：STA 模式下 Wi-Fi 每收到一帧（主要是 AP beacon/下行帧，约 2~10 帧/秒）回调一次 CSI 子载波 I/Q；人体贴近（约 1 米内）遮挡/改变首段传播路径，使接收幅度相对「无人基线」显著衰减 →「窗口幅度均值比基线低 ≥ `CSI_ENTER_DROP`（10%）」判定有人。CSI 无法真正测距，「1 米」是近场遮挡效应的近似，阈值按现场（AP 距离/摆放）微调（`app_config.rs`）。
+- **数据流**：CSI 回调（Wi-Fi 任务上下文，只做逐子载波功率累加 + 入环形缓冲，禁日志/分配）→ `csi_det` 检测线程（500ms 评估窗口均值/标准差）→ 状态机（迟滞 `CSI_ENTER/LEAVE_DROP` + 连续达标防抖 2s/6s）→ 状态变化时发 `csi/notify`。断流 30s 告警一次（Wi-Fi 空闲或 CSI 被关）。
+- **基线自适应**：仅「无人」状态自适应（τ≈25s）吸收环境慢漂移；「有人」状态冻结基线（否则久坐的人会被吸进基线导致漏检）。开机校准假设现场无人——校准时有人会污染基线，人走后 ~30s 自动修正，**首个「离开」事件可能漏报**；环境永久变化发生在有人期间可能造成状态粘滞 → 串口 `csi recal` 强制重新校准。
+- **通知消息**（`WOL_MQTT_CSI_NOTIFY_TOPIC` = `csi/notify`，固定主题不追加设备 id，消息内含 `id`，QoS 1）：
+  `{"id":"...","cmd":"csi","event":"init|change","state":"absent|present","drop":0.13,"std":0.02,"baseline":52.3,"amp":45.5,"frames":256}`。
+  开机校准完成后先发一条 `event:"init"`（state 按校准假设 = absent），之后有人↔无人各发一条 `event:"change"`；`drop` 正 = 幅度低于基线 = 有人贴近。
+- 串口 `csi` 查看实时量（state/baseline/amp/std/drop/rssi/frames），`csi recal` 重新校准基线。感知状态同时并入 `DeviceStatus.presence`（`/api/status`、MQTT 状态快照、串口 `status`、网页 UI 共用同一份数据）。
+
 ## HTTP 接口
 
 `control_http.rs`（`EspHttpServer`，由专属线程创建并持有；默认端口 80，`index.html` 用 `include_str!` 内嵌）：
@@ -218,7 +232,7 @@ WakeManager/
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | 内嵌单页 UI |
-| GET | `/api/status` | 状态 JSON：`id`、`ip`、`ssid`、`rssi`、`heap`、`mqtt_connected`、`broadcast`、`mac_count`、`temp_c`、`time`、`version`、`ota`（OTA 状态机） |
+| GET | `/api/status` | 状态 JSON：`id`、`ip`、`ssid`、`rssi`、`heap`、`mqtt_connected`、`broadcast`、`mac_count`、`presence`（1 米内有人/无人）、`temp_c`、`time`、`version`、`ota`（OTA 状态机） |
 | GET | `/api/config` | 当前配置 JSON |
 | POST | `/api/config` | 保存配置（`x-www-form-urlencoded`），随后重载 MQTT |
 | GET | `/api/wake` | 发送魔术包，**`?mac=<MAC>` 必传**，可选 `?ip=<IP>` |
@@ -257,7 +271,7 @@ WakeManager/
    - 查状态：`{"cmd":"status"}` → 发布设备状态快照（含 `version` 与 `ota` 状态机）。
    - check/upgrade 只做触发（检查/下载在 OTA 专属 32KB 栈线程跑），进行中重复触发会回 `error: OTA 正在进行中`。
 
-**发布：** 命令结果、发现应答、地址簿列表发布到 `WOL_MQTT_STATUS_TOPIC`（`status`）。芯片温度仅在按需发布的状态快照（`temp_c` 字段）中返回。
+**发布：** 命令结果、发现应答、地址簿列表发布到 `WOL_MQTT_STATUS_TOPIC`（`status`）。芯片温度仅在按需发布的状态快照（`temp_c` 字段）中返回。CSI 近场感知的状态变化通知发布到 `WOL_MQTT_CSI_NOTIFY_TOPIC`（`csi/notify`，见「Wi-Fi CSI 近场人体感知」）。
 
 **指示灯：** `led_status` 在 MQTT **收发数据**时使 LED 快速闪烁约 **2 秒**，随后自动恢复到闪烁前由 `set()` 设定的状态（连接中慢闪 / 已连接常亮）。
 

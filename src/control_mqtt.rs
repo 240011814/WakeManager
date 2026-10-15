@@ -8,6 +8,7 @@
 //!   - ota/<id>：OTA 升级命令（check / upgrade / status）
 //! 发布：
 //!   - status：命令结果、发现应答、地址簿列表
+//!   - csi/notify：CSI 近场感知状态变化通知（由 csi_presence 触发）
 //!
 //! 生命周期用 esp-idf-svc 的 `EspMqttClient`：`EspMqttClient::new` 返回
 //! `(client, connection)`，由一个专属线程持有 `connection` 并用阻塞的
@@ -69,6 +70,8 @@ const MAX_CMD_LEN: usize = 255;
 enum ApiOp {
     SubscribeAll,
     Publish(String),
+    /// CSI 近场感知通知（csi/notify 主题）
+    Notify(String),
 }
 
 /// 对应 C 版 publish_status()：发布原始字符串到 status 主题（QoS 1）。
@@ -84,6 +87,23 @@ fn publish_status(msg: &str) {
     };
     if tx.send(ApiOp::Publish(msg.to_string())).is_err() {
         ::log::warn!("MQTT publish skipped (worker gone): {msg}");
+    }
+}
+
+/// CSI 近场感知通知（`csi/notify` 主题，QoS 1）：状态变化（1 米内有人↔无人）
+/// 时由 `csi_presence` 发布。经 API 工作线程执行（事件处理路径不可直接调用
+/// client API）。
+pub fn publish_notify(msg: &str) {
+    // MQTT 发送活动指示
+    led_status::activity();
+
+    let tx = API_TX.lock().unwrap();
+    let Some(tx) = tx.as_ref() else {
+        ::log::warn!("MQTT notify skipped (client not started): {msg}");
+        return;
+    };
+    if tx.send(ApiOp::Notify(msg.to_string())).is_err() {
+        ::log::warn!("MQTT notify skipped (worker gone): {msg}");
     }
 }
 
@@ -429,28 +449,19 @@ fn api_worker(mut client: EspMqttClient<'static>, rx: mpsc::Receiver<ApiOp>) {
                     }
                 }
             }
-            ApiOp::Publish(msg) => {
-                match client.publish(
-                    ac::WOL_MQTT_STATUS_TOPIC,
-                    QoS::AtLeastOnce,
-                    false,
-                    msg.as_bytes(),
-                ) {
-                    Ok(id) => ::log::info!(
-                        "Publishing to \"{}\": \"{}\" (msg_id={})",
-                        ac::WOL_MQTT_STATUS_TOPIC,
-                        msg,
-                        id
-                    ),
-                    Err(e) => ::log::error!(
-                        "Failed to publish to \"{}\": {e:?}",
-                        ac::WOL_MQTT_STATUS_TOPIC
-                    ),
-                }
-            }
+            ApiOp::Publish(msg) => publish_msg(&mut client, ac::WOL_MQTT_STATUS_TOPIC, &msg),
+            ApiOp::Notify(msg) => publish_msg(&mut client, ac::WOL_MQTT_CSI_NOTIFY_TOPIC, &msg),
         }
     }
     ::log::info!("MQTT API worker terminated");
+}
+
+/// 在 API 工作线程内执行一次 publish（QoS 1、不保留）
+fn publish_msg(client: &mut EspMqttClient<'static>, topic: &str, msg: &str) {
+    match client.publish(topic, QoS::AtLeastOnce, false, msg.as_bytes()) {
+        Ok(id) => ::log::info!("Publishing to \"{topic}\": \"{msg}\" (msg_id={id})"),
+        Err(e) => ::log::error!("Failed to publish to \"{topic}\": {e:?}"),
+    }
 }
 
 /// 对应 C 版 dns_debug_task()：一次性 DNS 诊断日志

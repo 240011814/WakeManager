@@ -27,6 +27,8 @@ pub struct DeviceStatus {
     pub mqtt_connected: bool,
     pub broadcast: String,
     pub mac_count: usize,
+    /// CSI 近场感知：1 米内有/无人（"calibrating" 校准中 / "absent" 无人 / "present" 有人）
+    pub presence: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temp_c: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,6 +54,7 @@ pub fn device_status() -> DeviceStatus {
         mqtt_connected: crate::control_mqtt::is_connected(),
         broadcast: wol::get_default_broadcast(),
         mac_count: mac_store::count(),
+        presence: crate::csi_presence::presence(),
         temp_c: crate::chip_temp::read().ok(),
         time: time_sync::is_synced().then(time_sync::format_now),
         boot_time: time_sync::boot_time(),
