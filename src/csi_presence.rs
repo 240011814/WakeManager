@@ -12,9 +12,14 @@
 //!   检测线程（500ms 评估窗口均值/波动）→ 状态机（迟滞 + 持续防抖）→
 //!   **状态变化时**发布 JSON 通知到 MQTT `csi/notify` 主题（有人↔无人各发一条）
 //!
-//! **开机即关闭 Wi-Fi 省电**（`esp_wifi_set_ps(WIFI_PS_NONE)`）：省电模式下射频大部分
-//! 时间休眠，CSI 帧率只有 ~0.2 帧/秒（实测 40 帧收了 3 分钟），检测时序完全失真；
-//! 常开后约 10 帧/秒（beacon 速率），校准 4s、窗口 2s 才符合设计。
+//! **帧率依赖主动探测流量**（关键教训）：CSI 只对 **OFDM/HT 速率**的帧生成，AP 的
+//! beacon 走 802.11b/CCK 基本速率**不产生 CSI**——STA 静默时帧率只有 ~0.2 帧/秒
+//! （实测 40 帧收 3 分钟，关 Wi-Fi 省电也救不回来），窗口横跨几分钟、人体扰动被
+//! 完全抹平。因此开机即：① 关省电（`esp_wifi_set_ps(WIFI_PS_NONE)`）；② **UDP
+//! 单播探测流量**打默认网关（每帧必被 AP MAC-ACK，`dump_ack_en` 下 ACK 帧出 CSI，
+//! `CSI_PROBE_INTERVAL_MS`=50ms → 20 包/s，稳定不依赖对端回应）；③ ICMP ping 网关
+//! 补充数据帧 CSI（echo reply 的 LTF 齐全）。窗口按时长（`CSI_WINDOW_MS`=2s）不按
+//! 帧数统计，帧率变化不影响检测时序。
 //!
 //! 基线自适应：只在「无人」状态自适应（τ≈25s），吸收环境慢漂移；「有人」状态
 //! 冻结基线（否则久坐的人会被吸进基线导致漏检）。开机校准假设现场无人——若
@@ -26,6 +31,7 @@
 //! 开启；函数声明不随该开关门控，绑定始终可见）。
 
 use std::collections::VecDeque;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -35,12 +41,15 @@ use esp_idf_svc::sys::*;
 use crate::app_config as ac;
 use crate::control_mqtt;
 use crate::device_info;
+use crate::netinfo;
 
 /// 一帧 CSI 的轻量统计（回调 → 检测线程）
 struct FrameStat {
     /// 幅度度量：各子载波平均功率开方（同一度量下做相对比较，无需绝对标定）
     amp: f32,
     rssi: i8,
+    /// 收帧时刻（时长窗口统计用，回调里盖戳）
+    at: Instant,
 }
 
 /// 回调写入的环形缓冲（Wi-Fi 任务上下文，锁内只做 push/淘汰，不阻塞）
@@ -168,6 +177,7 @@ unsafe extern "C" fn csi_rx_cb(_ctx: *mut core::ffi::c_void, data: *mut wifi_csi
     let stat = FrameStat {
         amp: (power / n as f32).sqrt(),
         rssi: info.rx_ctrl.rssi() as i8,
+        at: Instant::now(),
     };
 
     if let Ok(mut ring) = RING.lock() {
@@ -178,23 +188,46 @@ unsafe extern "C" fn csi_rx_cb(_ctx: *mut core::ffi::c_void, data: *mut wifi_csi
     }
 }
 
-/// 最近 `n` 帧幅度的 (均值, 总体标准差)
-fn window_stats(hist: &VecDeque<f32>, n: usize) -> (f32, f32) {
-    let take = n.min(hist.len());
-    if take == 0 {
-        return (0.0, 0.0);
+/// 全部历史帧幅度的均值（基线校准用）
+fn mean_all(hist: &VecDeque<FrameStat>) -> f32 {
+    if hist.is_empty() {
+        return 0.0;
     }
     let mut sum = 0f32;
-    for v in hist.iter().skip(hist.len() - take) {
-        sum += *v;
+    for f in hist {
+        sum += f.amp;
     }
-    let mean = sum / take as f32;
+    sum / hist.len() as f32
+}
+
+/// 最近 `window_ms` 毫秒内帧幅度的 (均值, 总体标准差, 样本数)。
+/// **时长窗口**（非帧数窗口）：探测流量帧率变化时窗口覆盖的真实时间不变。
+fn window_stats(hist: &VecDeque<FrameStat>, window_ms: u64, now: Instant) -> (f32, f32, usize) {
+    let cutoff = now - Duration::from_millis(window_ms);
+    let mut sum = 0f32;
+    let mut n = 0usize;
+    for f in hist.iter().rev() {
+        if f.at < cutoff {
+            break;
+        }
+        sum += f.amp;
+        n += 1;
+    }
+    if n == 0 {
+        return (0.0, 0.0, 0);
+    }
+    let mean = sum / n as f32;
     let mut var = 0f32;
-    for v in hist.iter().skip(hist.len() - take) {
-        let d = v - mean;
+    let mut seen = 0usize;
+    for f in hist.iter().rev() {
+        if f.at < cutoff {
+            break;
+        }
+        let d = f.amp - mean;
         var += d * d;
+        seen += 1;
     }
-    (mean, (var / take as f32).sqrt())
+    (mean, (var / seen as f32).sqrt(), n)
 }
 
 fn update_snapshot(
@@ -226,7 +259,7 @@ fn detector_task() {
     ::log::info!("CSI presence detector started");
     let tick = Duration::from_millis(ac::CSI_EVAL_INTERVAL_MS);
 
-    let mut hist: VecDeque<f32> = VecDeque::new(); // 帧幅度历史（滑动窗口取尾部）
+    let mut hist: VecDeque<FrameStat> = VecDeque::new(); // 帧历史（时长窗口取最近段）
     let mut rssi_last: i8 = 0;
     let mut baseline: f32 = 0.0;
     let mut state = State::Calibrating;
@@ -248,8 +281,8 @@ fn detector_task() {
                 if hist.len() >= ac::CSI_HIST_CAP {
                     hist.pop_front();
                 }
-                hist.push_back(f.amp);
                 rssi_last = f.rssi;
+                hist.push_back(f);
                 frames_total += 1;
                 fresh += 1;
             }
@@ -316,7 +349,7 @@ fn detector_task() {
                 calib_logged = true;
             }
             if hist.len() >= ac::CSI_CALIB_FRAMES {
-                let (amp, _) = window_stats(&hist, hist.len());
+                let amp = mean_all(&hist);
                 baseline = amp;
                 state = State::Absent;
                 cand = None;
@@ -326,7 +359,7 @@ fn detector_task() {
                     hist.len(),
                     rssi_last
                 );
-                let (m, sd) = window_stats(&hist, ac::CSI_WINDOW_FRAMES);
+                let (m, sd, _) = window_stats(&hist, ac::CSI_WINDOW_MS, Instant::now());
                 let drop = if baseline > 0.0 {
                     (baseline - m) / baseline
                 } else {
@@ -336,7 +369,7 @@ fn detector_task() {
                 publish_event("init", State::Absent, &snap);
             } else {
                 // 校准中也刷新测量值快照，定期打印可观察当前读数
-                let (m, sd) = window_stats(&hist, ac::CSI_WINDOW_FRAMES);
+                let (m, sd, _) = window_stats(&hist, ac::CSI_WINDOW_MS, Instant::now());
                 update_snapshot(
                     State::Calibrating,
                     0.0,
@@ -350,11 +383,11 @@ fn detector_task() {
             continue;
         }
 
-        // ---- 窗口统计（帧不足一窗 = Wi-Fi 过于安静，保持现状）----
-        if hist.len() < ac::CSI_WINDOW_FRAMES {
+        // ---- 窗口统计（时长窗口；样本不足 = 帧率异常低，保持现状）----
+        let (amp, std, n) = window_stats(&hist, ac::CSI_WINDOW_MS, Instant::now());
+        if n < ac::CSI_WINDOW_MIN_FRAMES {
             continue;
         }
-        let (amp, std) = window_stats(&hist, ac::CSI_WINDOW_FRAMES);
         let drop = if baseline > 0.0 {
             (baseline - amp) / baseline
         } else {
@@ -449,8 +482,81 @@ pub fn recalibrate() {
     RECAL.store(true, Ordering::SeqCst);
 }
 
-/// 启动近场感知：关闭 Wi-Fi 省电 → 注册 CSI 配置/回调并使能 → 拉起检测线程。
-/// 需在 Wi-Fi 启动后调用；CSI 数据只在收到帧（AP beacon 等）时产生。
+/// 拿不到默认网关时的兜底 ping 目标（阿里公共 DNS，国内常可达）
+const PING_FALLBACK: [u8; 4] = [223, 5, 5, 5];
+
+/// UDP 探测流量线程：向默认网关单播小包。**每帧都被 AP MAC 层 ACK**，
+/// `dump_ack_en` 下 ACK 帧出 CSI——这是主帧源：速率稳定，不依赖对端回应
+/// 或 ICMP 限速策略。端口 9（discard）：网关静默丢弃或回 ICMP 不可达均可，
+/// 两种情况 MAC ACK 都存在。
+fn probe_task(target_ip: [u8; 4], interval_ms: u64) {
+    let addr = SocketAddr::from((target_ip, 9));
+    let sock = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(e) => {
+            ::log::warn!("CSI probe socket bind failed: {e:?} (ACK-CSI source off)");
+            return;
+        }
+    };
+    let payload = [0u8; 32];
+    loop {
+        let _ = sock.send_to(&payload, addr);
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+}
+
+/// 启动持续 ICMP ping（无限会话，内部 ping 任务跑，本模块不持有句柄）：
+/// 补充**数据帧** CSI（echo reply 走 OFDM/HT 速率，LTF 齐全，与 ACK 帧的
+/// LLTF 互补）。CSI 只对 OFDM/HT 速率帧生成，AP beacon 走 CCK 基本速率不出
+/// CSI（静默时 ~0.2 帧/秒），故必须主动制造下行流量。
+fn start_ping(target_ip: [u8; 4]) {
+    // ip_addr_t = { u_addr: ip4|ip6, type_ }，IPv4 手工构造（IP_ADDR4_INIT 宏不可见）
+    let mut target: ip_addr_t = unsafe { std::mem::zeroed() };
+    target.type_ = lwip_ip_addr_type_IPADDR_TYPE_V4 as u8;
+    // union 字段写入是安全操作（读才是 unsafe）
+    target.u_addr.ip4.addr = u32::from_le_bytes(target_ip);
+
+    let cfg = esp_ping_config_t {
+        count: 0, // 无限 ping
+        interval_ms: ac::CSI_PING_INTERVAL_MS,
+        timeout_ms: 1_000,
+        data_size: 32,
+        tos: 0,
+        ttl: 64,
+        target_addr: target,
+        task_stack_size: 4096,
+        task_prio: 2,
+        interface: 0, // NETIF_NO_INDEX
+    };
+    let cbs = esp_ping_callbacks_t {
+        cb_args: core::ptr::null_mut(),
+        on_ping_success: None,
+        on_ping_timeout: None,
+        on_ping_end: None,
+    };
+
+    unsafe {
+        let mut hdl: esp_ping_handle_t = core::ptr::null_mut();
+        if esp_ping_new_session(&cfg, &cbs, &mut hdl) != ESP_OK {
+            ::log::warn!("CSI ping session create failed (CSI frame rate may stay low)");
+            return;
+        }
+        if esp_ping_start(hdl) != ESP_OK {
+            ::log::warn!("CSI ping session start failed (CSI frame rate may stay low)");
+        }
+    }
+    ::log::info!(
+        "CSI ping probe started: target={}.{}.{}.{} interval={}ms (generates CSI frames)",
+        target_ip[0],
+        target_ip[1],
+        target_ip[2],
+        target_ip[3],
+        ac::CSI_PING_INTERVAL_MS
+    );
+}
+
+/// 启动近场感知：关闭 Wi-Fi 省电 → 注册 CSI 配置/回调并使能 → 启动 ping 探测流量
+/// → 拉起检测线程。需在 Wi-Fi 启动后调用；CSI 数据只在收到帧时产生。
 pub fn start() -> Result<(), esp_err_t> {
     // 省电模式（modem sleep）下射频大部分时间休眠，CSI 帧率只有 ~0.2 帧/秒，
     // 校准要 3 分钟、检测时序失真；本设备常供电，直接关闭省电换帧率（~10 帧/s）。
@@ -470,7 +576,7 @@ pub fn start() -> Result<(), esp_err_t> {
         channel_filter_en: true,
         manu_scale: false, // 自动缩放
         shift: 0,
-        dump_ack_en: false, // 不需要 ACK 帧的 CSI
+        dump_ack_en: true, // AP 对上行帧的 ACK 也出 CSI（补帧率，尽力而为）
     };
 
     let err = unsafe {
@@ -491,6 +597,16 @@ pub fn start() -> Result<(), esp_err_t> {
         return Err(err);
     }
     ::log::info!("Wi-Fi CSI enabled (near-field presence probe)");
+
+    // 主动探测流量（帧率来源，见模块注释）：
+    // ① UDP 单播 → AP MAC ACK（主帧源，20 包/s）；② ICMP echo reply（数据帧补充）
+    let target_ip = netinfo::sta_gateway().unwrap_or(PING_FALLBACK);
+    start_ping(target_ip);
+    std::thread::Builder::new()
+        .name("csi_probe".into())
+        .stack_size(4096)
+        .spawn(move || probe_task(target_ip, ac::CSI_PROBE_INTERVAL_MS))
+        .expect("spawn csi probe task");
 
     std::thread::Builder::new()
         .name("csi_det".into())

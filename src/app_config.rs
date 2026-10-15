@@ -74,8 +74,11 @@ pub const OTA_CHECK_URL: &str = "https://api.github.com/repos/240011814/WakeMana
 pub const CSI_EVAL_INTERVAL_MS: u64 = 500;
 /// 开机基线校准所需帧数（CSI 帧来自 AP beacon/下行帧；Wi-Fi 省电关闭后约 10 帧/s）
 pub const CSI_CALIB_FRAMES: usize = 40;
-/// 判定窗口帧数（最近 N 帧的幅度均值/波动与基线比较，约 2s）
-pub const CSI_WINDOW_FRAMES: usize = 20;
+/// 判定窗口时长（ms）：最近 2s 内的帧参与均值/波动统计（**时长窗口**，帧率无关，
+/// 探测流量 20 包/s 时约 40 个样本）
+pub const CSI_WINDOW_MS: u64 = 2_000;
+/// 窗口最少样本数（不足不判定，保持现状；探测流量异常低时防误判）
+pub const CSI_WINDOW_MIN_FRAMES: usize = 8;
 /// 环形缓冲/历史保留帧数上限
 pub const CSI_HIST_CAP: usize = 512;
 /// 判定「有人」的帧间波动阈值（**主判据**）：窗口 std/幅度均值 ≥ 7%
@@ -96,6 +99,14 @@ pub const CSI_LEAVE_SUSTAIN_MS: u64 = 6_000;
 pub const CSI_BASELINE_ALPHA: f32 = 0.02;
 /// CSI 数据断流告警阈值（ms 无新帧告警一次：Wi-Fi 空闲或 CSI 被关闭）
 pub const CSI_STALL_WARN_MS: u64 = 30_000;
+/// CSI 探测流量（ping 网关）间隔（ms）：CSI 只对 OFDM/HT 帧生成，AP beacon
+/// 走 CCK 基本速率不出 CSI，必须主动让 AP 回数据帧；300ms ≈ 3+ 帧/秒
+pub const CSI_PING_INTERVAL_MS: u32 = 300;
+/// CSI 探测 UDP 流量间隔（ms）：向默认网关单播小包，**每帧必被 AP MAC 层 ACK**
+///（dump_ack_en 下 ACK 帧出 CSI），速率稳定、不依赖对端回应/ICMP 策略；
+/// 50ms = 20 包/s（参考方案的 50~100 包/s 是双设备对发场景，单设备经 AP 回程
+/// 20 包/s 已给足 2s 窗口 ~40 样本）
+pub const CSI_PROBE_INTERVAL_MS: u64 = 50;
 /// 定期打印间隔（ms）：每 5s 打一行当前基线与测量值，现场观察检测量/调阈值用；
 /// 0 = 关闭定期打印（状态变化日志不受影响）
 pub const CSI_LOG_INTERVAL_MS: u64 = 5_000;

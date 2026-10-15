@@ -24,7 +24,9 @@ strip = "symbols"
 
 [profile.dev]
 debug = true    # Symbols are nice, and they don't increase the size on Flash
-opt-level = "z"
+# 性能优先（-O2，2026-10 提速参考）：CSI 回调/Wi-Fi 中断路径的解析效率、
+# flash 加载开销都吃优化等级；镜像槽 3.75MB 余量充足
+opt-level = 2
 
 [dependencies]
 log = "0.4"

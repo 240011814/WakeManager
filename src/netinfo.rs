@@ -30,6 +30,24 @@ pub fn sta_ip() -> String {
     }
 }
 
+/// STA 默认网关 IPv4（网络字节序 → [a,b,c,d]），无网关返回 None
+pub fn sta_gateway() -> Option<[u8; 4]> {
+    unsafe {
+        let netif = esp_netif_get_handle_from_ifkey(c"WIFI_STA_DEF".as_ptr());
+        if netif.is_null() {
+            return None;
+        }
+        let mut ip_info: esp_netif_ip_info_t = std::mem::zeroed();
+        if esp_netif_get_ip_info(netif, &mut ip_info) != ESP_OK {
+            return None;
+        }
+        if ip_info.gw.addr == 0 {
+            return None;
+        }
+        Some(ip_info.gw.addr.to_le_bytes())
+    }
+}
+
 /// 当前连接的 SSID 与 RSSI（未连接返回 None，与 `esp_wifi_sta_get_ap_info` 失败一致）
 pub fn sta_ssid_rssi() -> Option<(String, i8)> {
     unsafe {
