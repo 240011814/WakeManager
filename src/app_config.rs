@@ -66,18 +66,24 @@ pub const OTA_CHECK_URL: &str = "https://api.github.com/repos/240011814/WakeMana
 
 
 /* ---------- Wi-Fi CSI 近场人体感知（csi_presence） ----------
- * 「1 米内有人」= 近场遮挡近似：人体贴近使接收幅度相对无人基线显著衰减。
- * 阈值需按现场（AP 距离/摆放）微调，串口 `csi` 命令可实时观察各量。 */
+ * 「1 米内有人」= 近场扰动近似：人体贴近活动使帧间波动骤增（实测静场
+ * std/amp≈2%，1 米内活动 ≈13%），幅度均值也可能衰减。阈值按现场微调，
+ * 串口 `csi` 命令可实时观察各量。 */
 
 /// 检测线程评估周期（ms）
 pub const CSI_EVAL_INTERVAL_MS: u64 = 500;
-/// 开机基线校准所需帧数（CSI 帧来自 AP beacon/下行帧，约 2~10 帧/s）
+/// 开机基线校准所需帧数（CSI 帧来自 AP beacon/下行帧；Wi-Fi 省电关闭后约 10 帧/s）
 pub const CSI_CALIB_FRAMES: usize = 40;
-/// 判定窗口帧数（最近 N 帧的幅度均值/波动与基线比较，约 2~10s）
+/// 判定窗口帧数（最近 N 帧的幅度均值/波动与基线比较，约 2s）
 pub const CSI_WINDOW_FRAMES: usize = 20;
 /// 环形缓冲/历史保留帧数上限
 pub const CSI_HIST_CAP: usize = 512;
-/// 判定「有人」的幅度衰减阈值：窗口均值比基线低 10% 以上
+/// 判定「有人」的帧间波动阈值（**主判据**）：窗口 std/幅度均值 ≥ 7%
+/// （实测静场 ≈2.3%，人贴近活动 ≈13.5%）
+pub const CSI_ENTER_STD: f32 = 0.07;
+/// 判定「无人」的波动阈值（迟滞）：回落到 4.5% 以内
+pub const CSI_LEAVE_STD: f32 = 0.045;
+/// 判定「有人」的幅度衰减阈值（辅判据，遮挡型贴近）：窗口均值比基线低 10% 以上
 pub const CSI_ENTER_DROP: f32 = 0.10;
 /// 判定「无人」的衰减阈值（迟滞）：回落到 5% 以内
 pub const CSI_LEAVE_DROP: f32 = 0.05;
@@ -90,6 +96,9 @@ pub const CSI_LEAVE_SUSTAIN_MS: u64 = 6_000;
 pub const CSI_BASELINE_ALPHA: f32 = 0.02;
 /// CSI 数据断流告警阈值（ms 无新帧告警一次：Wi-Fi 空闲或 CSI 被关闭）
 pub const CSI_STALL_WARN_MS: u64 = 30_000;
+/// 定期打印间隔（ms）：每 5s 打一行当前基线与测量值，现场观察检测量/调阈值用；
+/// 0 = 关闭定期打印（状态变化日志不受影响）
+pub const CSI_LOG_INTERVAL_MS: u64 = 5_000;
 
 /* ---------- Address book ---------- */
 

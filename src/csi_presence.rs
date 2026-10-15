@@ -1,15 +1,20 @@
 //! WakeManager - Wi-Fi CSI 近场人体感知（探测 ~1 米内是否有人）
 //!
-//! 原理（**近场遮挡近似**，非精确测距）：STA 模式下 Wi-Fi 每收到一帧（主要是 AP 的
-//! beacon 与下行帧，约 2~10 帧/秒）就给出 CSI（信道状态信息）子载波 I/Q 数据。
-//! 人体贴近设备（约 1 米内）会遮挡/改变首段传播路径，使接收幅度相对「无人基线」
-//! 显著衰减；把「最近窗口的幅度均值比基线低 ≥ 阈值」判定为 1 米内有人。
-//! CSI 无法真正测距，「1 米」是近场遮挡效应的近似，阈值按现场微调（见 app_config）。
+//! 原理（**近场扰动近似**，非精确测距）：STA 模式下 Wi-Fi 每收到一帧（主要是 AP 的
+//! beacon 与下行帧）就给出 CSI（信道状态信息）子载波 I/Q 数据。人体贴近设备（约 1 米内）
+//! 活动会显著改变信道：帧间波动（std）大幅升高（实测静场 std/amp ≈ 2.3%，1 米内活动
+//! ≈ 13.5%），幅度均值也可能衰减/起伏。判定 = 「窗口帧间波动 ≥ 阈值」**或**
+//! 「幅度相对无人基线衰减 ≥ 阈值」→ 有人。CSI 无法真正测距，「1 米」是近场扰动强度的
+//! 近似（远处走动也可能触发），阈值按现场微调（见 app_config）。
 //!
 //! 数据流：
 //!   Wi-Fi 任务（CSI 回调，只做轻量统计，禁日志/分配）→ 环形缓冲 →
-//!   检测线程（500ms 评估：窗口均值 vs 基线）→ 状态机（迟滞 + 持续防抖）→
+//!   检测线程（500ms 评估窗口均值/波动）→ 状态机（迟滞 + 持续防抖）→
 //!   **状态变化时**发布 JSON 通知到 MQTT `csi/notify` 主题（有人↔无人各发一条）
+//!
+//! **开机即关闭 Wi-Fi 省电**（`esp_wifi_set_ps(WIFI_PS_NONE)`）：省电模式下射频大部分
+//! 时间休眠，CSI 帧率只有 ~0.2 帧/秒（实测 40 帧收了 3 分钟），检测时序完全失真；
+//! 常开后约 10 帧/秒（beacon 速率），校准 4s、窗口 2s 才符合设计。
 //!
 //! 基线自适应：只在「无人」状态自适应（τ≈25s），吸收环境慢漂移；「有人」状态
 //! 冻结基线（否则久坐的人会被吸进基线导致漏检）。开机校准假设现场无人——若
@@ -230,6 +235,7 @@ fn detector_task() {
     let mut last_frame_at = Instant::now();
     let mut stalled_warned = false;
     let mut calib_logged = false;
+    let mut last_print = Instant::now();
 
     loop {
         std::thread::sleep(tick);
@@ -260,12 +266,43 @@ fn detector_task() {
             stalled_warned = true;
         }
 
+        // ---- 每 CSI_LOG_INTERVAL_MS 打印当前基线与测量值（观察检测量/调阈值）----
+        if ac::CSI_LOG_INTERVAL_MS > 0
+            && last_print.elapsed() >= Duration::from_millis(ac::CSI_LOG_INTERVAL_MS)
+        {
+            last_print = Instant::now();
+            let s = SNAPSHOT.lock().unwrap();
+            if s.state == State::Calibrating.as_str() {
+                ::log::info!(
+                    "csi: 校准中 {}/{} frames amp={:.1} std={:.2} rssi={} dBm",
+                    s.frames,
+                    ac::CSI_CALIB_FRAMES,
+                    s.amp,
+                    s.std,
+                    s.rssi
+                );
+            } else {
+                ::log::info!(
+                    "csi: state={} baseline={:.1} amp={:.1} std={:.2} rs={:.3} drop={:.3} rssi={} dBm frames={}",
+                    s.state,
+                    s.baseline,
+                    s.amp,
+                    s.std,
+                    if s.amp > 0.0 { s.std / s.amp } else { 0.0 },
+                    s.drop,
+                    s.rssi,
+                    s.frames
+                );
+            }
+        }
+
         // ---- 重新校准（串口 csi recal）----
         if RECAL.swap(false, Ordering::SeqCst) {
             ::log::info!("CSI recalibration requested, collecting new baseline");
             state = State::Calibrating;
             cand = None;
             hist.clear();
+            frames_total = 0; // 帧计数改为「自本次校准起」，校准进度显示才准确
             calib_logged = false;
         }
 
@@ -290,14 +327,21 @@ fn detector_task() {
                     rssi_last
                 );
                 let (m, sd) = window_stats(&hist, ac::CSI_WINDOW_FRAMES);
-                let snap = update_snapshot(State::Absent, baseline, m, sd, 0.0, rssi_last, frames_total);
+                let drop = if baseline > 0.0 {
+                    (baseline - m) / baseline
+                } else {
+                    0.0
+                };
+                let snap = update_snapshot(State::Absent, baseline, m, sd, drop, rssi_last, frames_total);
                 publish_event("init", State::Absent, &snap);
             } else {
+                // 校准中也刷新测量值快照，定期打印可观察当前读数
+                let (m, sd) = window_stats(&hist, ac::CSI_WINDOW_FRAMES);
                 update_snapshot(
                     State::Calibrating,
                     0.0,
-                    0.0,
-                    0.0,
+                    m,
+                    sd,
                     0.0,
                     rssi_last,
                     frames_total,
@@ -316,11 +360,15 @@ fn detector_task() {
         } else {
             0.0
         };
+        // 帧间波动相对值（主判据）：静场 ≈0.023，人体贴近活动实测 ≈0.135
+        let rel_std = if amp > 0.0 { std / amp } else { 0.0 };
 
         // ---- 状态机：迟滞阈值 + 连续达标防抖 ----
-        let target = if drop >= ac::CSI_ENTER_DROP {
+        // 有人：波动骤增（人体活动）或幅度显著衰减（遮挡型贴近）任一达标
+        // 无人：两者都回落到迟滞阈值以内
+        let target = if rel_std >= ac::CSI_ENTER_STD || drop >= ac::CSI_ENTER_DROP {
             Some(State::Present)
-        } else if drop <= ac::CSI_LEAVE_DROP {
+        } else if rel_std <= ac::CSI_LEAVE_STD && drop <= ac::CSI_LEAVE_DROP {
             Some(State::Absent)
         } else {
             None // 迟滞带内：不翻转也不累计
@@ -375,18 +423,22 @@ pub fn presence() -> &'static str {
 /// 串口 `csi` 命令输出
 pub fn snapshot_text() -> String {
     let s = SNAPSHOT.lock().unwrap();
+    let rs = if s.amp > 0.0 { s.std / s.amp } else { 0.0 };
     format!(
-        "csi state={} baseline={:.1} amp={:.1} std={:.2} drop={:.3} rssi={} dBm frames={}\r\n\
-         判定: drop>={:.2} 连续 {}ms → 1m有人；drop<={:.2} 连续 {}ms → 1m无人（csi recal 重新校准）",
+        "csi state={} baseline={:.1} amp={:.1} std={:.2} rs={:.3} drop={:.3} rssi={} dBm frames={}\r\n\
+         判定: rs(std/amp)>={:.2} 或 drop>={:.2} 连续 {}ms → 1m有人；rs<={:.2} 且 drop<={:.2} 连续 {}ms → 1m无人（csi recal 重新校准）",
         s.state,
         s.baseline,
         s.amp,
         s.std,
+        rs,
         s.drop,
         s.rssi,
         s.frames,
+        ac::CSI_ENTER_STD,
         ac::CSI_ENTER_DROP,
         ac::CSI_ENTER_SUSTAIN_MS,
+        ac::CSI_LEAVE_STD,
         ac::CSI_LEAVE_DROP,
         ac::CSI_LEAVE_SUSTAIN_MS,
     )
@@ -397,9 +449,17 @@ pub fn recalibrate() {
     RECAL.store(true, Ordering::SeqCst);
 }
 
-/// 启动近场感知：注册 CSI 配置/回调并使能，拉起检测线程。
+/// 启动近场感知：关闭 Wi-Fi 省电 → 注册 CSI 配置/回调并使能 → 拉起检测线程。
 /// 需在 Wi-Fi 启动后调用；CSI 数据只在收到帧（AP beacon 等）时产生。
 pub fn start() -> Result<(), esp_err_t> {
+    // 省电模式（modem sleep）下射频大部分时间休眠，CSI 帧率只有 ~0.2 帧/秒，
+    // 校准要 3 分钟、检测时序失真；本设备常供电，直接关闭省电换帧率（~10 帧/s）。
+    // 注意：stop() 不存在，省电保持关闭（恢复可调 esp_wifi_set_ps(WIFI_PS_MIN_MODEM)）。
+    let err = unsafe { esp_wifi_set_ps(wifi_ps_type_t_WIFI_PS_NONE) };
+    if err != ESP_OK {
+        ::log::warn!("esp_wifi_set_ps(WIFI_PS_NONE) failed: {err:#x} (CSI frame rate may be low)");
+    }
+
     // wifi_csi_config_t 无 Default 可用值（Default 全 false，会关掉所有 LTF），
     // 按 esp_wifi.h 文档默认值手工构造
     let cfg = wifi_csi_config_t {
@@ -434,7 +494,9 @@ pub fn start() -> Result<(), esp_err_t> {
 
     std::thread::Builder::new()
         .name("csi_det".into())
-        .stack_size(4096)
+        // 栈含日志格式化（localtime_r）+ serde_json + FFI 余量；4096 实测栈溢出
+        //（task pthread 栈金丝雀报警，2026-10 真机），8192 与 mqtt 事件线程同级
+        .stack_size(8192)
         .spawn(detector_task)
         .expect("spawn csi detector task");
     Ok(())

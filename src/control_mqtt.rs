@@ -516,10 +516,10 @@ pub fn start() -> Result<(), MqttStartError> {
         ota: format!("{}/{}", ac::WOL_MQTT_OTA_TOPIC, dev_id),
     });
 
-    // 诊断：日志打印 broker 域名解析结果
+    // 诊断：日志打印 broker 域名解析结果（getaddrinfo 调用链深，3072 太紧）
     std::thread::Builder::new()
         .name("mqtt_dns".into())
-        .stack_size(3072)
+        .stack_size(4096)
         .spawn({
             let uri = cfg.mqtt_uri.clone();
             move || dns_debug(uri)

@@ -24,6 +24,17 @@ CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1=y
 CONFIG_LOG_VERSION_2=y
 CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM_FULL=y
 
+# --- WakeManager: 8MB PSRAM（立创 ESP32S3R8N8：octal PSRAM）---
+# 大分配（JSON/OTA 下载缓冲等）落 PSRAM，缓解内部 RAM 压力（std::thread 的
+# 任务栈固定从内部分配，见 CLAUDE.md 开发经验）。
+# IGNORE_NOTFOUND：Wokwi 模拟无 PSRAM 时不 panic 只降级（Wi-Fi/LWIP 缓冲退回
+# 无 PSRAM 默认值）；真机有 PSRAM 时正常启用。
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
 # --- WakeManager: Wi-Fi CSI 近场人体感知（csi_presence）---
 # CSI 每收到一帧（AP beacon/下行帧）回调一次；额外占用约
 # CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM KB RAM
