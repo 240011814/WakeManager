@@ -76,7 +76,7 @@ cargo espflash flash --monitor                 # 自定义分区表已编进构�
 | --- | --- | --- |
 | `help` | `cmd` / `menu` / `?` | 返回命令菜单 |
 | `status` | `st` | 设备状态文本（与 `/api/status` 同一份数据）：id/ip/ssid/rssi/heap/mqtt/broadcast/macs/presence/temp/time |
-| `csi` | — | CSI 近场感知实时量：state（calibrating/absent/present）/baseline/amp/std/drop/rssi/frames；`csi recal` 强制重新校准基线 |
+| `csi` | — | CSI 趋势探测实时量：last（none/approach/leave）/amp/level/floor/slope/rs/rssi/frames；approach = 靠近（斜率快路径 + 水位慢路径），leave = 离开（水位回空场地板 + 近期有活动），各方向每次趋势只发一条通知 |
 | `wifi-clear` | `reset-wifi` | 清除 NVS 里的 Wi-Fi 配置（SSID/密码）→ 回复确认 → 300ms 后重启 → 开机检测到未配网，自动重新进入 BLE 配网（App 扫日志里的 QR / PoP）。**破坏性操作，设备需重新配网才能联网** |
 
 示例（在串口终端里发 `help` / `status`）：
@@ -86,7 +86,7 @@ cargo espflash flash --monitor                 # 自定义分区表已编进构�
 ==== WakeManager 串口命令 ====
 help         显示本菜单
 status       查看设备状态
-csi          查看 CSI 近场感知状态（csi recal 重新校准基线）
+csi          查看 CSI 趋势探测状态（approach=靠近 / leave=离开）
 wifi-clear   清除 Wi-Fi 配置并重新进入配网模式（设备将重启）
 
 > status

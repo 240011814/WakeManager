@@ -1,30 +1,38 @@
-//! WakeManager - Wi-Fi CSI 近场人体感知（探测 ~1 米内是否有人）
+//! WakeManager - Wi-Fi CSI 近场趋势探测（靠近 / 离开两个事件）
 //!
-//! 原理（**近场扰动近似**，非精确测距）：STA 模式下 Wi-Fi 每收到一帧（主要是 AP 的
-//! beacon 与下行帧）就给出 CSI（信道状态信息）子载波 I/Q 数据。人体贴近设备（约 1 米内）
-//! 活动会显著改变信道：帧间波动（std）大幅升高（实测静场 std/amp ≈ 2.3%，1 米内活动
-//! ≈ 13.5%），幅度均值也可能衰减/起伏。判定 = 「窗口帧间波动 ≥ 阈值」**或**
-//! 「幅度相对无人基线衰减 ≥ 阈值」→ 有人。CSI 无法真正测距，「1 米」是近场扰动强度的
-//! 近似（远处走动也可能触发），阈值按现场微调（见 app_config）。
+//! 产品语义（2026-10 定稿，明确只报两个触发）：
+//!   - **approach（靠近）**：① 上升斜率 ≥ +3%（**快路径**：带动作走近，2s 内）；
+//!     ② 平滑水位 ≥ 空场地板 ×1.02 持续 3s（**慢路径**：安静坐下/走近——实测
+//!     水位 1~2 分钟慢慢爬升，纯斜率判据拖 2 分钟才触发）
+//!   - **leave（离开）**：平滑水位**回到空场地板** ×1.015 以内持续 3s，**且近 8s
+//!     内有活动**（人离开必有行走动作；坐着时的水位下凹是安静的——活动限定
+//!     防下凹误报）
+//! 不做「有人/无人」状态判定、不做基线校准（地板 = 滑动窗口最小值，自学习）。
+//!
+//! **leave 为什么不用下降斜率**（真机跳变教训）：坐着的人静止水位只比空场高
+//! ~4%，动作峰却 +10~30%——下降斜率把"坐着时的动作回落"全当成了离开，
+//! approach/leave 3~5s 交替跳变。改为认「回到空场地板」后：坐着时水位始终在
+//! 地板 +4% 以上 → 完全静默；人真走了水位落到地板 → 报 leave。
+//!
+//! 触发语义：每个方向**每次趋势只发一条**（交替触发防刷屏）+ 最小事件间隔
+//! `CSI_TREND_REFRACTORY_MS` 兜底。响应 ≤5s（2s 平滑窗 + 1s/1.5s 防抖）。
 //!
 //! 数据流：
-//!   Wi-Fi 任务（CSI 回调，只做轻量统计，禁日志/分配）→ 环形缓冲 →
-//!   检测线程（500ms 评估窗口均值/波动）→ 状态机（迟滞 + 持续防抖）→
-//!   **状态变化时**发布 JSON 通知到 MQTT `csi/notify` 主题（有人↔无人各发一条）
+//!   Wi-Fi 任务（CSI 回调，只做幅度统计，禁日志/分配）→ 环形缓冲 →
+//!   检测线程（500ms 评估窗口幅度 + 趋势斜率）→ **趋势事件**发布 JSON 通知到
+//!   MQTT `csi/notify` 主题：`{"id":..,"cmd":"csi","event":"approach|leave",
+//!   "slope":..,"amp":..,"rs":..,"frames":..}`
 //!
 //! **帧率依赖主动探测流量**（关键教训）：CSI 只对 **OFDM/HT 速率**的帧生成，AP 的
-//! beacon 走 802.11b/CCK 基本速率**不产生 CSI**——STA 静默时帧率只有 ~0.2 帧/秒
-//! （实测 40 帧收 3 分钟，关 Wi-Fi 省电也救不回来），窗口横跨几分钟、人体扰动被
-//! 完全抹平。因此开机即：① 关省电（`esp_wifi_set_ps(WIFI_PS_NONE)`）；② **UDP
-//! 单播探测流量**打默认网关（每帧必被 AP MAC-ACK，`dump_ack_en` 下 ACK 帧出 CSI，
-//! `CSI_PROBE_INTERVAL_MS`=50ms → 20 包/s，稳定不依赖对端回应）；③ ICMP ping 网关
-//! 补充数据帧 CSI（echo reply 的 LTF 齐全）。窗口按时长（`CSI_WINDOW_MS`=2s）不按
-//! 帧数统计，帧率变化不影响检测时序。
+//! beacon 走 802.11b/CCK 基本速率**不产生 CSI**——STA 静默时帧率只有 ~0.2 帧/秒。
+//! 因此开机即：① 关省电（`esp_wifi_set_ps(WIFI_PS_NONE)`）；② **UDP 单播探测流量**
+//! 打默认网关（每帧必被 AP MAC-ACK，`dump_ack_en` 下 ACK 帧出 CSI）；③ ICMP ping
+//! 网关（100ms = 10 帧/s 保底）——必须留兜底：UDP 的 ACK 在速率自适应落到 CCK 时
+//! 会断流（实测 30s 空窗）。窗口按时长（`CSI_WINDOW_MS`=2s）统计，帧率无关。
 //!
-//! 基线自适应：只在「无人」状态自适应（τ≈25s），吸收环境慢漂移；「有人」状态
-//! 冻结基线（否则久坐的人会被吸进基线导致漏检）。开机校准假设现场无人——若
-//! 校准时有人，基线会被污染，人走后 ~30s 自动修正，首个「离开」事件可能漏报；
-//! 环境永久变化发生在有人期间可能造成状态粘滞，串口 `csi recal` 强制重新校准。
+//! 幅度度量 = **全部子载波段 RMS**（LLTF+HTLTF+STBC 混合；实测对活动最敏感）。
+//! 注意：人体贴近在本机实测是**幅度上升**（+5~10%）；若换环境出现贴近反而下降，
+//! 上升/下降的事件语义会互换（改 CSI_TREND_ENTER 的符号解释即可）。
 //!
 //! FFI：`esp_wifi_set_csi_config / esp_wifi_set_csi_rx_cb / esp_wifi_set_csi`
 //! （需 sdkconfig 开 `CONFIG_ESP_WIFI_CSI_ENABLED`，本项目已在 sdkconfig.defaults
@@ -32,7 +40,6 @@
 
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -45,7 +52,7 @@ use crate::netinfo;
 
 /// 一帧 CSI 的轻量统计（回调 → 检测线程）
 struct FrameStat {
-    /// 幅度度量：各子载波平均功率开方（同一度量下做相对比较，无需绝对标定）
+    /// 幅度度量：全部子载波段 RMS（对活动最敏感）
     amp: f32,
     rssi: i8,
     /// 收帧时刻（时长窗口统计用，回调里盖戳）
@@ -55,23 +62,20 @@ struct FrameStat {
 /// 回调写入的环形缓冲（Wi-Fi 任务上下文，锁内只做 push/淘汰，不阻塞）
 static RING: Mutex<VecDeque<FrameStat>> = Mutex::new(VecDeque::new());
 
-/// 检测状态
+/// 趋势方向
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum State {
-    /// 校准中（收集无人基线）
-    Calibrating,
-    /// 1 米内无人
-    Absent,
-    /// 1 米内有人
-    Present,
+enum Trend {
+    /// 上升 = 靠近
+    Approach,
+    /// 下降 = 离开
+    Leave,
 }
 
-impl State {
+impl Trend {
     fn as_str(self) -> &'static str {
         match self {
-            State::Calibrating => "calibrating",
-            State::Absent => "absent",
-            State::Present => "present",
+            Trend::Approach => "approach",
+            Trend::Leave => "leave",
         }
     }
 }
@@ -79,64 +83,60 @@ impl State {
 /// 检测线程每拍刷新的状态快照（串口 `csi` 命令读取）
 #[derive(Clone, Copy)]
 pub struct Snapshot {
-    pub state: &'static str,
-    /// 无人基线幅度
-    pub baseline: f32,
+    /// 最近一次趋势事件："none" / "approach" / "leave"
+    pub last: &'static str,
     /// 当前窗口幅度均值
     pub amp: f32,
+    /// 平滑水位（动作毛刺被压掉；离开判定用）
+    pub level: f32,
+    /// 空场地板：近 10 分钟平滑水位最小值
+    pub floor: f32,
+    /// 趋势斜率：(当前 − 3s 前) / 3s 前
+    pub slope: f32,
     /// 当前窗口帧间波动（总体标准差）
     pub std: f32,
-    /// 相对衰减 = (baseline - amp) / baseline，正 = 比基线低 = 有人贴近
-    pub drop: f32,
     pub rssi: i8,
-    /// 累计收到的 CSI 帧数（诊断用）
+    /// 自本次启动收到的 CSI 帧数（诊断用，饱和计数不回绕）
     pub frames: u64,
 }
 
 static SNAPSHOT: Mutex<Snapshot> = Mutex::new(Snapshot {
-    state: "calibrating",
-    baseline: 0.0,
+    last: "none",
     amp: 0.0,
+    level: 0.0,
+    floor: 0.0,
+    slope: 0.0,
     std: 0.0,
-    drop: 0.0,
     rssi: 0,
     frames: 0,
 });
 
-/// 串口 `csi recal`：强制重新校准基线（环境永久变化导致状态粘滞时的恢复手段）
-static RECAL: AtomicBool = AtomicBool::new(false);
-
-/// 发布到 `csi/notify` 的通知消息
+/// 发布到 `csi/notify` 的趋势事件消息
 #[derive(serde::Serialize)]
 struct NotifyMsg<'a> {
     id: &'a str,
     cmd: &'a str,
-    /// "init" = 开机校准完成的初始状态；"change" = 状态变化
+    /// "approach" = 靠近（上升趋势）；"leave" = 离开（下降趋势）
     event: &'a str,
-    /// "absent" = 1 米内无人；"present" = 1 米内有人
-    state: &'a str,
-    /// 相对衰减（正 = 幅度低于基线 = 有人贴近）
-    drop: f32,
-    /// 窗口内帧间波动（总体标准差）
-    std: f32,
-    baseline: f32,
+    /// 触发时刻的相对斜率（3s 变化率）
+    slope: f32,
     amp: f32,
+    /// 帧间波动相对值（std/amp，诊断用）
+    rs: f32,
     frames: u64,
 }
 
-/// 状态变化（含开机初始状态）→ JSON 通知经 MQTT 发布路径入队
-fn publish_event(event: &str, state: State, snap: &Snapshot) {
+/// 趋势事件 → JSON 通知经 MQTT 发布路径入队
+fn publish_event(event: Trend, slope: f32, amp: f32, rs: f32, frames: u64) {
     let id = device_info::get_id();
     let msg = NotifyMsg {
         id: &id,
         cmd: "csi",
-        event,
-        state: state.as_str(),
-        drop: snap.drop,
-        std: snap.std,
-        baseline: snap.baseline,
-        amp: snap.amp,
-        frames: snap.frames,
+        event: event.as_str(),
+        slope,
+        amp,
+        rs,
+        frames,
     };
     match serde_json::to_string(&msg) {
         Ok(json) => control_mqtt::publish_notify(&json),
@@ -144,7 +144,7 @@ fn publish_event(event: &str, state: State, snap: &Snapshot) {
     }
 }
 
-/// CSI 接收回调（Wi-Fi 任务上下文）：只做逐子载波功率累加与入队，
+/// CSI 接收回调（Wi-Fi 任务上下文）：只算幅度 RMS 与入队，
 /// **不得**日志/分配/阻塞；缓冲由检测线程消费。
 unsafe extern "C" fn csi_rx_cb(_ctx: *mut core::ffi::c_void, data: *mut wifi_csi_info_t) {
     if data.is_null() {
@@ -188,18 +188,6 @@ unsafe extern "C" fn csi_rx_cb(_ctx: *mut core::ffi::c_void, data: *mut wifi_csi
     }
 }
 
-/// 全部历史帧幅度的均值（基线校准用）
-fn mean_all(hist: &VecDeque<FrameStat>) -> f32 {
-    if hist.is_empty() {
-        return 0.0;
-    }
-    let mut sum = 0f32;
-    for f in hist {
-        sum += f.amp;
-    }
-    sum / hist.len() as f32
-}
-
 /// 最近 `window_ms` 毫秒内帧幅度的 (均值, 总体标准差, 样本数)。
 /// **时长窗口**（非帧数窗口）：探测流量帧率变化时窗口覆盖的真实时间不变。
 fn window_stats(hist: &VecDeque<FrameStat>, window_ms: u64, now: Instant) -> (f32, f32, usize) {
@@ -218,57 +206,47 @@ fn window_stats(hist: &VecDeque<FrameStat>, window_ms: u64, now: Instant) -> (f3
     }
     let mean = sum / n as f32;
     let mut var = 0f32;
-    let mut seen = 0usize;
     for f in hist.iter().rev() {
         if f.at < cutoff {
             break;
         }
         let d = f.amp - mean;
         var += d * d;
-        seen += 1;
     }
-    (mean, (var / seen as f32).sqrt(), n)
+    (mean, (var / n as f32).sqrt(), n)
 }
 
-fn update_snapshot(
-    state: State,
-    baseline: f32,
-    amp: f32,
-    std: f32,
-    drop: f32,
-    rssi: i8,
-    frames: u64,
-) -> Snapshot {
-    let snap = Snapshot {
-        state: state.as_str(),
-        baseline,
-        amp,
-        std,
-        drop,
-        rssi,
-        frames,
-    };
+fn update_snapshot(snap: Snapshot) -> Snapshot {
     if let Ok(mut g) = SNAPSHOT.lock() {
         *g = snap;
     }
     snap
 }
 
-/// 检测线程：定时消费环形缓冲 → 窗口统计 → 状态机 → 状态变化发 MQTT 通知
+/// 检测线程：窗口幅度 → 趋势斜率 → approach/leave 事件发 MQTT 通知
 fn detector_task() {
-    ::log::info!("CSI presence detector started");
+    ::log::info!("CSI trend detector started");
     let tick = Duration::from_millis(ac::CSI_EVAL_INTERVAL_MS);
 
     let mut hist: VecDeque<FrameStat> = VecDeque::new(); // 帧历史（时长窗口取最近段）
+    let mut amp_hist: VecDeque<(Instant, f32)> = VecDeque::new(); // 平滑幅度历史（取 3s 前样本算斜率）
+    let mut floor_hist: VecDeque<(Instant, f32)> = VecDeque::new(); // 水位采样（空场地板 = 窗口最小值）
+    let mut level: f32 = 0.0; // 平滑水位（离开判定用）
+    let mut last_floor_at = Instant::now();
     let mut rssi_last: i8 = 0;
-    let mut baseline: f32 = 0.0;
-    let mut state = State::Calibrating;
     let mut frames_total: u64 = 0;
-    let mut cand: Option<(State, Instant)> = None; // 翻转候选 + 连续达标起点
+    let mut last_event: Option<Trend> = None;
+    let mut last_event_at = Instant::now()
+        .checked_sub(Duration::from_millis(ac::CSI_TREND_REFRACTORY_MS))
+        .unwrap_or_else(Instant::now);
+    let mut cand_up: Option<Instant> = None; // 上升斜率（快路径）的连续达标起点
+    let mut cand_lvl: Option<Instant> = None; // 水位超地板（慢路径）的连续达标起点
+    let mut cand_dn: Option<Instant> = None; // 回落空场地板的连续达标起点
+    let mut last_motion_at = Instant::now(); // 最后一次活动时刻（离开判定的活动限定）
     let mut last_frame_at = Instant::now();
     let mut stalled_warned = false;
-    let mut calib_logged = false;
     let mut last_print = Instant::now();
+    let started_at = Instant::now();
 
     loop {
         std::thread::sleep(tick);
@@ -283,7 +261,9 @@ fn detector_task() {
                 }
                 rssi_last = f.rssi;
                 hist.push_back(f);
-                frames_total += 1;
+                // 饱和计数：u64 在 20 帧/s 下约 290 亿年才到顶，saturating 只是
+                // 兜底——绝不允许回绕成 0 干扰诊断显示
+                frames_total = frames_total.saturating_add(1);
                 fresh += 1;
             }
         }
@@ -299,194 +279,225 @@ fn detector_task() {
             stalled_warned = true;
         }
 
-        // ---- 每 CSI_LOG_INTERVAL_MS 打印当前基线与测量值（观察检测量/调阈值）----
+        // ---- 窗口统计（样本不足 = 帧率异常低，保持现状）----
+        let now = Instant::now();
+        let (amp, std, n) = window_stats(&hist, ac::CSI_WINDOW_MS, now);
+        if n < ac::CSI_WINDOW_MIN_FRAMES {
+            continue;
+        }
+        let rs = if amp > 0.0 { std / amp } else { 0.0 };
+
+        // ---- 平滑水位（压掉动作毛刺）与空场地板（滑动窗口最小值）----
+        level = if level <= 0.0 {
+            amp
+        } else {
+            level + ac::CSI_LEVEL_ALPHA * (amp - level)
+        };
+        if last_floor_at.elapsed() >= Duration::from_millis(5_000) {
+            last_floor_at = now;
+            floor_hist.push_back((now, level));
+            let cut = now - Duration::from_millis(ac::CSI_FLOOR_WINDOW_MS);
+            while matches!(floor_hist.front(), Some((at, _)) if *at < cut) {
+                floor_hist.pop_front();
+            }
+        }
+        let floor = floor_hist
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(level, f32::min);
+
+        // ---- 趋势斜率：当前平滑幅度 vs CSI_TREND_WINDOW_MS 前 ----
+        amp_hist.push_back((now, amp));
+        while amp_hist.len() > 24 {
+            amp_hist.pop_front(); // 保留 ~12s，远超比较间隔
+        }
+        let target_at = now - Duration::from_millis(ac::CSI_TREND_WINDOW_MS);
+        let old = amp_hist
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= target_at)
+            .map(|(_, v)| *v);
+        let slope = match old {
+            Some(s_old) if s_old > 0.0 => (amp - s_old) / s_old,
+            _ => 0.0, // 历史不足（开机前几秒），热身期也会跳过事件
+        };
+
+        // ---- 每 CSI_LOG_INTERVAL_MS 打印当前测量值（观察/调阈值）----
         if ac::CSI_LOG_INTERVAL_MS > 0
             && last_print.elapsed() >= Duration::from_millis(ac::CSI_LOG_INTERVAL_MS)
         {
             last_print = Instant::now();
-            let s = SNAPSHOT.lock().unwrap();
-            if s.state == State::Calibrating.as_str() {
-                ::log::info!(
-                    "csi: 校准中 {}/{} frames amp={:.1} std={:.2} rssi={} dBm",
-                    s.frames,
-                    ac::CSI_CALIB_FRAMES,
-                    s.amp,
-                    s.std,
-                    s.rssi
-                );
-            } else {
-                ::log::info!(
-                    "csi: state={} baseline={:.1} amp={:.1} std={:.2} rs={:.3} drop={:.3} rssi={} dBm frames={}",
-                    s.state,
-                    s.baseline,
-                    s.amp,
-                    s.std,
-                    if s.amp > 0.0 { s.std / s.amp } else { 0.0 },
-                    s.drop,
-                    s.rssi,
-                    s.frames
-                );
-            }
+            let s = *SNAPSHOT.lock().unwrap();
+            ::log::info!(
+                "csi: last={} amp={:.1} level={:.1} floor={:.1} slope={:+.3} rs={:.3} rssi={} dBm frames={}",
+                s.last,
+                s.amp,
+                s.level,
+                s.floor,
+                s.slope,
+                rs,
+                s.rssi,
+                s.frames
+            );
         }
 
-        // ---- 重新校准（串口 csi recal）----
-        if RECAL.swap(false, Ordering::SeqCst) {
-            ::log::info!("CSI recalibration requested, collecting new baseline");
-            state = State::Calibrating;
-            cand = None;
-            hist.clear();
-            frames_total = 0; // 帧计数改为「自本次校准起」，校准进度显示才准确
-            calib_logged = false;
+        // ---- 事件判定（每个方向每次趋势只发一条 + 最小事件间隔兜底）----
+        // approach：① 上升斜率快路径（带动作走近，2s）② 水位超地板慢路径
+        //（安静坐下——实测水位 1~2 分钟慢慢爬升，纯斜率判据拖 2 分钟，真机教训）
+        // leave：水位回到空场地板 **且近 8s 内有活动**（人离开必有行走动作；
+        // 坐着时的水位下凹是安静的——活动限定防下凹误报，真机跳变教训）
+        if rs >= ac::CSI_MOTION_RS || slope.abs() >= 0.02 {
+            last_motion_at = now;
         }
-
-        // ---- 校准：收够帧数取均值为无人基线，按「现场无人」初始化 ----
-        if state == State::Calibrating {
-            if !calib_logged {
-                ::log::info!(
-                    "CSI calibrating baseline (need {} frames, assuming nobody near)",
-                    ac::CSI_CALIB_FRAMES
-                );
-                calib_logged = true;
-            }
-            if hist.len() >= ac::CSI_CALIB_FRAMES {
-                let amp = mean_all(&hist);
-                baseline = amp;
-                state = State::Absent;
-                cand = None;
-                calib_logged = false;
-                ::log::info!(
-                    "CSI baseline calibrated: amp={baseline:.1} ({} frames, rssi={} dBm)",
-                    hist.len(),
-                    rssi_last
-                );
-                let (m, sd, _) = window_stats(&hist, ac::CSI_WINDOW_MS, Instant::now());
-                let drop = if baseline > 0.0 {
-                    (baseline - m) / baseline
+        let refractory_ok = last_event_at.elapsed()
+            >= Duration::from_millis(ac::CSI_TREND_REFRACTORY_MS);
+        if started_at.elapsed() >= Duration::from_millis(ac::CSI_TREND_WARMUP_MS) {
+            let fire_approach = |cand: &mut Option<Instant>| -> bool {
+                let since = cand.unwrap_or(now);
+                *cand = Some(since);
+                if since.elapsed() >= Duration::from_millis(ac::CSI_TREND_SUSTAIN_MS)
+                    && last_event != Some(Trend::Approach)
+                    && refractory_ok
+                {
+                    *cand = None;
+                    true
                 } else {
-                    0.0
-                };
-                let snap = update_snapshot(State::Absent, baseline, m, sd, drop, rssi_last, frames_total);
-                publish_event("init", State::Absent, &snap);
-            } else {
-                // 校准中也刷新测量值快照，定期打印可观察当前读数
-                let (m, sd, _) = window_stats(&hist, ac::CSI_WINDOW_MS, Instant::now());
-                update_snapshot(
-                    State::Calibrating,
-                    0.0,
-                    m,
-                    sd,
-                    0.0,
-                    rssi_last,
-                    frames_total,
-                );
-            }
-            continue;
-        }
-
-        // ---- 窗口统计（时长窗口；样本不足 = 帧率异常低，保持现状）----
-        let (amp, std, n) = window_stats(&hist, ac::CSI_WINDOW_MS, Instant::now());
-        if n < ac::CSI_WINDOW_MIN_FRAMES {
-            continue;
-        }
-        let drop = if baseline > 0.0 {
-            (baseline - amp) / baseline
-        } else {
-            0.0
-        };
-        // 帧间波动相对值（主判据）：静场 ≈0.023，人体贴近活动实测 ≈0.135
-        let rel_std = if amp > 0.0 { std / amp } else { 0.0 };
-
-        // ---- 状态机：迟滞阈值 + 连续达标防抖 ----
-        // 有人：波动骤增（人体活动）或幅度显著衰减（遮挡型贴近）任一达标
-        // 无人：两者都回落到迟滞阈值以内
-        let target = if rel_std >= ac::CSI_ENTER_STD || drop >= ac::CSI_ENTER_DROP {
-            Some(State::Present)
-        } else if rel_std <= ac::CSI_LEAVE_STD && drop <= ac::CSI_LEAVE_DROP {
-            Some(State::Absent)
-        } else {
-            None // 迟滞带内：不翻转也不累计
-        };
-
-        match target {
-            Some(t) if t == state => cand = None,
-            Some(t) => {
-                let since = match cand {
-                    Some((s, at)) if s == t => at,
-                    _ => Instant::now(),
-                };
-                cand = Some((t, since));
-                let sustain = if t == State::Present {
-                    ac::CSI_ENTER_SUSTAIN_MS
-                } else {
-                    ac::CSI_LEAVE_SUSTAIN_MS
-                };
-                if since.elapsed() >= Duration::from_millis(sustain) {
-                    state = t;
-                    cand = None;
-                    let snap =
-                        update_snapshot(state, baseline, amp, std, drop, rssi_last, frames_total);
-                    ::log::info!(
-                        "CSI presence: 1m {} (drop={:.3}, baseline={:.1}, amp={:.1}, std={:.2})",
-                        if state == State::Present { "有人" } else { "无人" },
-                        drop,
-                        baseline,
-                        amp,
-                        std
-                    );
-                    publish_event("change", state, &snap);
+                    false
                 }
+            };
+
+            // 上升斜率快路径 → approach
+            if slope >= ac::CSI_TREND_ENTER {
+                if fire_approach(&mut cand_up) {
+                    last_event = Some(Trend::Approach);
+                    last_event_at = now;
+                    cand_up = None;
+                    cand_lvl = None;
+                    cand_dn = None;
+                    ::log::info!(
+                        "CSI trend: {} via slope (slope={:+.3}, level={:.1}, floor={:.1}, rs={:.3})",
+                        Trend::Approach.as_str(),
+                        slope,
+                        level,
+                        floor,
+                        rs
+                    );
+                    publish_event(Trend::Approach, slope, level, rs, frames_total);
+                }
+            } else {
+                cand_up = None;
             }
-            None => cand = None,
+
+            // 水位超地板慢路径 → approach（安静坐下/走近）
+            if level >= floor * (1.0 + ac::CSI_APPROACH_MARGIN) {
+                let since = cand_lvl.unwrap_or(now);
+                cand_lvl = Some(since);
+                if since.elapsed() >= Duration::from_millis(ac::CSI_APPROACH_SUSTAIN_MS)
+                    && last_event != Some(Trend::Approach)
+                    && refractory_ok
+                {
+                    last_event = Some(Trend::Approach);
+                    last_event_at = now;
+                    cand_up = None;
+                    cand_lvl = None;
+                    cand_dn = None;
+                    ::log::info!(
+                        "CSI trend: {} via level (level={:.1} >= floor {:.1}x{:.2}, slope={:+.3}, rs={:.3})",
+                        Trend::Approach.as_str(),
+                        level,
+                        floor,
+                        1.0 + ac::CSI_APPROACH_MARGIN,
+                        slope,
+                        rs
+                    );
+                    publish_event(Trend::Approach, slope, level, rs, frames_total);
+                }
+            } else {
+                cand_lvl = None;
+            }
+
+            // 回落到空场地板 + 近期有活动 → leave
+            let motion_ok = last_event.is_none()
+                || last_motion_at.elapsed() < Duration::from_millis(ac::CSI_LEAVE_MOTION_MS);
+            if level <= floor * (1.0 + ac::CSI_LEAVE_MARGIN) && motion_ok {
+                let since = cand_dn.unwrap_or(now);
+                cand_dn = Some(since);
+                if since.elapsed() >= Duration::from_millis(ac::CSI_LEAVE_SUSTAIN_MS)
+                    && last_event != Some(Trend::Leave)
+                    && refractory_ok
+                {
+                    last_event = Some(Trend::Leave);
+                    last_event_at = now;
+                    cand_up = None;
+                    cand_lvl = None;
+                    cand_dn = None;
+                    ::log::info!(
+                        "CSI trend: {} (level={:.1} <= floor {:.1}x{:.2}, slope={:+.3}, rs={:.3})",
+                        Trend::Leave.as_str(),
+                        level,
+                        floor,
+                        1.0 + ac::CSI_LEAVE_MARGIN,
+                        slope,
+                        rs
+                    );
+                    publish_event(Trend::Leave, slope, level, rs, frames_total);
+                }
+            } else {
+                cand_dn = None;
+            }
         }
 
-        // ---- 基线自适应：仅「无人」状态（有人时冻结，防久坐被吸进基线）----
-        if state == State::Absent {
-            baseline += ac::CSI_BASELINE_ALPHA * (amp - baseline);
-        }
-
-        update_snapshot(state, baseline, amp, std, drop, rssi_last, frames_total);
+        update_snapshot(Snapshot {
+            last: last_event.map(|t| t.as_str()).unwrap_or("none"),
+            amp,
+            level,
+            floor,
+            slope,
+            std,
+            rssi: rssi_last,
+            frames: frames_total,
+        });
     }
 }
 
-/// 当前感知状态（"calibrating" / "absent" / "present"，供 DeviceStatus 等读取）
+/// 当前感知状态（DeviceStatus.presence）：最近事件 approach → "present"，
+/// 其余（含开机未触发过）→ "absent"。趋势事件才是权威输出，此字段仅兼容既有视图
 pub fn presence() -> &'static str {
-    SNAPSHOT.lock().map(|s| s.state).unwrap_or("calibrating")
+    match SNAPSHOT.lock().map(|s| s.last) {
+        Ok("approach") => "present",
+        _ => "absent",
+    }
 }
 
 /// 串口 `csi` 命令输出
 pub fn snapshot_text() -> String {
-    let s = SNAPSHOT.lock().unwrap();
-    let rs = if s.amp > 0.0 { s.std / s.amp } else { 0.0 };
+    let s = *SNAPSHOT.lock().unwrap();
     format!(
-        "csi state={} baseline={:.1} amp={:.1} std={:.2} rs={:.3} drop={:.3} rssi={} dBm frames={}\r\n\
-         判定: rs(std/amp)>={:.2} 或 drop>={:.2} 连续 {}ms → 1m有人；rs<={:.2} 且 drop<={:.2} 连续 {}ms → 1m无人（csi recal 重新校准）",
-        s.state,
-        s.baseline,
+        "csi last={} amp={:.1} level={:.1} floor={:.1} slope={:+.3} std={:.2} rssi={} dBm frames={}\r\n\
+         判定: slope>={:.2} 或 level>=floor*{:.2} 持续 {}ms → approach（靠近）；\
+         level<=floor*{:.2} 持续 {}ms 且近 {}ms 有活动 → leave（离开）；每方向每次趋势只发一条",
+        s.last,
         s.amp,
+        s.level,
+        s.floor,
+        s.slope,
         s.std,
-        rs,
-        s.drop,
         s.rssi,
         s.frames,
-        ac::CSI_ENTER_STD,
-        ac::CSI_ENTER_DROP,
-        ac::CSI_ENTER_SUSTAIN_MS,
-        ac::CSI_LEAVE_STD,
-        ac::CSI_LEAVE_DROP,
+        ac::CSI_TREND_ENTER,
+        1.0 + ac::CSI_APPROACH_MARGIN,
+        ac::CSI_APPROACH_SUSTAIN_MS,
+        1.0 + ac::CSI_LEAVE_MARGIN,
         ac::CSI_LEAVE_SUSTAIN_MS,
+        ac::CSI_LEAVE_MOTION_MS,
     )
-}
-
-/// 串口 `csi recal`：请求重新校准基线（检测线程下拍执行）
-pub fn recalibrate() {
-    RECAL.store(true, Ordering::SeqCst);
 }
 
 /// 拿不到默认网关时的兜底 ping 目标（阿里公共 DNS，国内常可达）
 const PING_FALLBACK: [u8; 4] = [223, 5, 5, 5];
 
 /// UDP 探测流量线程：向默认网关单播小包。**每帧都被 AP MAC 层 ACK**，
-/// `dump_ack_en` 下 ACK 帧出 CSI——这是主帧源：速率稳定，不依赖对端回应
+/// `dump_ack_en` 下 ACK 帧出 CSI——主帧源：速率稳定，不依赖对端回应
 /// 或 ICMP 限速策略。端口 9（discard）：网关静默丢弃或回 ICMP 不可达均可，
 /// 两种情况 MAC ACK 都存在。
 fn probe_task(target_ip: [u8; 4], interval_ms: u64) {
@@ -506,9 +517,8 @@ fn probe_task(target_ip: [u8; 4], interval_ms: u64) {
 }
 
 /// 启动持续 ICMP ping（无限会话，内部 ping 任务跑，本模块不持有句柄）：
-/// 补充**数据帧** CSI（echo reply 走 OFDM/HT 速率，LTF 齐全，与 ACK 帧的
-/// LLTF 互补）。CSI 只对 OFDM/HT 速率帧生成，AP beacon 走 CCK 基本速率不出
-/// CSI（静默时 ~0.2 帧/秒），故必须主动制造下行流量。
+/// echo reply 走 HT 速率**必出** CSI，是稳定帧源的兜底（UDP 的 ACK 在速率
+/// 自适应落到 CCK 时会断流）。100ms = 10 帧/s 保底。
 fn start_ping(target_ip: [u8; 4]) {
     // ip_addr_t = { u_addr: ip4|ip6, type_ }，IPv4 手工构造（IP_ADDR4_INIT 宏不可见）
     let mut target: ip_addr_t = unsafe { std::mem::zeroed() };
@@ -555,11 +565,11 @@ fn start_ping(target_ip: [u8; 4]) {
     );
 }
 
-/// 启动近场感知：关闭 Wi-Fi 省电 → 注册 CSI 配置/回调并使能 → 启动 ping 探测流量
+/// 启动趋势探测：关闭 Wi-Fi 省电 → 注册 CSI 配置/回调并使能 → 启动探测流量
 /// → 拉起检测线程。需在 Wi-Fi 启动后调用；CSI 数据只在收到帧时产生。
 pub fn start() -> Result<(), esp_err_t> {
-    // 省电模式（modem sleep）下射频大部分时间休眠，CSI 帧率只有 ~0.2 帧/秒，
-    // 校准要 3 分钟、检测时序失真；本设备常供电，直接关闭省电换帧率（~10 帧/s）。
+    // 省电模式（modem sleep）下射频大部分时间休眠，CSI 帧率只有 ~0.2 帧/秒；
+    // 本设备常供电，直接关闭省电换帧率。
     // 注意：stop() 不存在，省电保持关闭（恢复可调 esp_wifi_set_ps(WIFI_PS_MIN_MODEM)）。
     let err = unsafe { esp_wifi_set_ps(wifi_ps_type_t_WIFI_PS_NONE) };
     if err != ESP_OK {
@@ -576,7 +586,7 @@ pub fn start() -> Result<(), esp_err_t> {
         channel_filter_en: true,
         manu_scale: false, // 自动缩放
         shift: 0,
-        dump_ack_en: true, // AP 对上行帧的 ACK 也出 CSI（补帧率，尽力而为）
+        dump_ack_en: true, // AP 对上行帧的 ACK 也出 CSI（主帧源，见 probe_task）
     };
 
     let err = unsafe {
@@ -596,10 +606,10 @@ pub fn start() -> Result<(), esp_err_t> {
         ::log::error!("Wi-Fi CSI init failed: {err:#x}");
         return Err(err);
     }
-    ::log::info!("Wi-Fi CSI enabled (near-field presence probe)");
+    ::log::info!("Wi-Fi CSI enabled (approach/leave trend probe)");
 
     // 主动探测流量（帧率来源，见模块注释）：
-    // ① UDP 单播 → AP MAC ACK（主帧源，20 包/s）；② ICMP echo reply（数据帧补充）
+    // ① UDP 单播 → AP MAC ACK（主帧源，20 包/s）；② ICMP echo reply（10 帧/s 保底）
     let target_ip = netinfo::sta_gateway().unwrap_or(PING_FALLBACK);
     start_ping(target_ip);
     std::thread::Builder::new()

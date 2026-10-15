@@ -213,19 +213,19 @@ WakeManager/
 - **广播地址自动推导**：`directed broadcast = (ip & netmask) | ~netmask`，用 STA 网卡 IP 与掩码计算，支持任意前缀长度；网卡无 IP 时回退 `255.255.255.255`。
 - API：`wol::send_to(mac, dest_ip)`、`send_str_to(mac_str, dest_ip)`、`get_default_broadcast()`。
 
-## Wi-Fi CSI 近场人体感知（csi_presence）
+## Wi-Fi CSI 近场趋势探测（csi_presence）
 
-`csi_presence.rs`（需 sdkconfig `CONFIG_ESP_WIFI_CSI_ENABLED=y`，已在 sdkconfig.defaults 开启）：探测 **~1 米内是否有人**，状态变化时发 MQTT 通知。
+`csi_presence.rs`（需 sdkconfig `CONFIG_ESP_WIFI_CSI_ENABLED=y`，已在 sdkconfig.defaults 开启）。**产品语义（2026-10 定稿）：只报两个事件，不做「有人/无人」状态判定、不做基线校准**：
 
-- **原理（近场扰动近似，非精确测距）**：STA 模式下 Wi-Fi 每收到一帧（主要是 AP beacon/下行帧）回调一次 CSI 子载波 I/Q；人体贴近（约 1 米内）活动会显著改变信道——**帧间波动 std 骤增**（实测静场 std/amp ≈ 2.3%，1 米内活动 ≈ 13.5%），幅度均值也可能衰减/起伏。判定 = 「窗口 `std/amp` ≥ `CSI_ENTER_STD`（7%）」**或**「幅度比基线低 ≥ `CSI_ENTER_DROP`（10%）」→ 有人；两者都回落到迟滞阈值内 → 无人。**实测教训**：只看均值衰减会完全失灵（贴近时幅度只动 ~4% 且方向可上可下），std 才是主判据。CSI 无法真正测距，远处走动也可能触发，阈值按现场微调（`app_config.rs`）。
-- **数据流**：CSI 回调（Wi-Fi 任务上下文，只做逐子载波功率累加 + 入环形缓冲，禁日志/分配）→ `csi_det` 检测线程（500ms 评估窗口均值/波动）→ 状态机（迟滞 `CSI_ENTER/LEAVE_STD` + `CSI_ENTER/LEAVE_DROP` + 连续达标防抖 2s/6s）→ 状态变化时发 `csi/notify`。断流 30s 告警一次（Wi-Fi 空闲或 CSI 被关）。
-- **帧率依赖主动探测流量（关键教训）**：CSI 只对 **OFDM/HT 速率**的帧生成，AP 的 beacon 走 802.11b/CCK 基本速率**不产生 CSI**——STA 静默时帧率只有 ~0.2 帧/秒（实测 40 帧收 3 分钟；只关 Wi-Fi 省电 `esp_wifi_set_ps(WIFI_PS_NONE)` **救不回来**，2026-10 真机验证），窗口横跨几分钟、人体扰动被抹平。开机即：① 关省电；② **UDP 单播探测流量**打默认网关（`CSI_PROBE_INTERVAL_MS`=50ms → 20 包/s；每帧必被 AP MAC-ACK，`dump_ack_en` 下 ACK 帧出 CSI，**稳定不依赖对端回应/ICMP 限速**——这比「双设备对发 50~100 包/s」更贴合单设备场景）；③ ICMP ping 网关（300ms）补充 echo reply 数据帧 CSI（LTF 齐全，与 ACK 帧的 LLTF 互补）。判定窗口按时长（`CSI_WINDOW_MS`=2s，最少 `CSI_WINDOW_MIN_FRAMES` 样本）不按帧数，帧率变化不影响检测时序。
-- **基线自适应**：仅「无人」状态自适应（τ≈25s）吸收环境慢漂移；「有人」状态冻结基线（否则久坐的人会被吸进基线导致漏检）。开机校准假设现场无人——校准时有人会污染基线，人走后 ~30s 自动修正，**首个「离开」事件可能漏报**；环境永久变化发生在有人期间可能造成状态粘滞 → 串口 `csi recal` 强制重新校准。
+- **两个触发**：**`approach`（靠近）= ① 上升斜率 ≥+3%（快路径，带动作走近 ~2s）② 平滑水位 ≥ 空场地板 ×1.02 持续 3s（慢路径，安静坐下）**；**`leave`（离开）= 水位回到空场地板 ×1.015 持续 3s 且近 8s 内有活动**。三条真机教训：① 纯斜率判不了安静走近（实测水位 1~2 分钟慢慢爬升，3s 斜率仅 +0.003，拖 2 分钟才触发）→ 必须有水位慢路径；② 纯下降斜率会被坐着时的动作回落误触发（3~5s 交替跳变）→ 离开认「回到空场地板」；③ 坐着时水位偶尔下凹到空场水位（实测 level 19.1 vs 地板 19.2）→ 离开加**活动限定**（人离开必有行走动作，下凹是安静的）。地板 = 10 分钟滑动最小值自学习，无基线校准；**开机时人在设备旁会污染地板**（人真正离开一次后自动校正）。
+- **触发语义**：各方向每次趋势只发一条（交替触发防刷屏）+ 最小事件间隔 `CSI_TREND_REFRACTORY_MS`（15s）兜底。响应：靠近 ~2s（带动作）/ ~10s（安静坐下），离开 ~5s。热身 `CSI_TREND_WARMUP_MS`（5s）内不触发；开机首条 leave 免活动限定。水位平滑 `CSI_LEVEL_ALPHA`（τ≈1.7s）压掉动作毛刺。
+- **幅度度量 = 全段 RMS**（LLTF+HTLTF+STBC 混合；实测对活动最敏感，纯 LLTF 均值会把扰动削掉一半以上）。本机实测人体贴近是**幅度上升**（+5~10%）；换环境若贴近反而下降，两个事件语义互换。历史教训：形状距离方案在本机幅度量级（~10/127，int8 量化步长 ~10%）下被量化噪声淹没，已弃用。
+- **数据流**：CSI 回调（Wi-Fi 任务，只算幅度 RMS + 入环形缓冲，禁日志/分配）→ `csi_det` 检测线程（500ms 评估时长窗口 + 斜率）→ 趋势事件发 `csi/notify`。断流 30s 告警一次。
+- **帧率依赖主动探测流量（关键教训）**：CSI 只对 **OFDM/HT 速率**的帧生成，AP 的 beacon 走 802.11b/CCK 基本速率**不产生 CSI**——STA 静默时帧率只有 ~0.2 帧/秒；只关 Wi-Fi 省电（`esp_wifi_set_ps(WIFI_PS_NONE)`）**救不回来**。开机即：① 关省电；② **UDP 单播探测流量**打默认网关（`CSI_PROBE_INTERVAL_MS`=50ms → 20 包/s；每帧必被 AP MAC-ACK，`dump_ack_en` 下 ACK 帧出 CSI）；③ ICMP ping 网关（**100ms = 10 帧/s 保底**）——必须留兜底：UDP 的 ACK 在速率自适应落到 CCK 时会断流（实测 30s 空窗）。判定窗口按时长（`CSI_WINDOW_MS`=2s）不按帧数。
 - **通知消息**（`WOL_MQTT_CSI_NOTIFY_TOPIC` = `csi/notify`，固定主题不追加设备 id，消息内含 `id`，QoS 1）：
-  `{"id":"...","cmd":"csi","event":"init|change","state":"absent|present","drop":0.13,"std":0.02,"baseline":52.3,"amp":45.5,"frames":256}`。
-  开机校准完成后先发一条 `event:"init"`（state 按校准假设 = absent），之后有人↔无人各发一条 `event:"change"`；`drop` 正 = 幅度低于基线 = 有人贴近。
-- **定期打印**：每 `CSI_LOG_INTERVAL_MS`（默认 5s，0 = 关闭）打一行当前基线与测量值 `csi: state=... baseline=... amp=... std=... rs=... drop=... rssi=... frames=...`（`rs` = std/amp，主判据量），用于现场观察检测量是否符合预期、微调阈值。
-- 串口 `csi` 查看实时量（state/baseline/amp/std/drop/rssi/frames），`csi recal` 重新校准基线。感知状态同时并入 `DeviceStatus.presence`（`/api/status`、MQTT 状态快照、串口 `status`、网页 UI 共用同一份数据）。
+  `{"id":"...","cmd":"csi","event":"approach|leave","slope":0.052,"amp":20.3,"rs":0.11,"frames":1234}`。
+- **定期打印**：每 `CSI_LOG_INTERVAL_MS`（默认 5s，0 = 关闭）一行 `csi: last=... amp=... level=... floor=... slope=... rs=... rssi=... frames=...`——调参看 `level` 与 `floor` 的间距（坐着 ≈ +4%，空场 ≈ 0）和 `slope` 与 `CSI_TREND_ENTER` 的关系。`frames` 为**饱和计数**（u64，20 帧/s ≈ 290 亿年到顶，`saturating_add` 兜底防回绕）。
+- 串口 `csi` 查看实时量与判定规则。`DeviceStatus.presence` 为兼容视图（最近事件 approach → `present`，其余 `absent`），权威输出是 `csi/notify` 的趋势事件。
 
 ## HTTP 接口
 
