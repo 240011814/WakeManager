@@ -27,8 +27,8 @@ pub struct DeviceStatus {
     pub mqtt_connected: bool,
     pub broadcast: String,
     pub mac_count: usize,
-    /// CSI 趋势探测（兼容视图）：最近事件 approach → "present"，其余 "absent"；
-    /// 权威输出是 `csi/notify` 的 approach/leave 趋势事件
+    /// CSI 近场感知（兼容视图）：最近事件 approach → "present"，其余 "absent"；
+    /// 权威输出是 `csi/notify` 的 approach/leave 事件
     pub presence: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temp_c: Option<f32>,

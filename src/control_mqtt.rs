@@ -8,7 +8,7 @@
 //!   - ota/<id>：OTA 升级命令（check / upgrade / status）
 //! 发布：
 //!   - status：命令结果、发现应答、地址簿列表
-//!   - csi/notify：CSI 近场感知状态变化通知（由 csi_presence 触发）
+//!   - csi/notify：CSI 近场感知靠近/离开事件通知（由 csi_presence 触发）
 //!
 //! 生命周期用 esp-idf-svc 的 `EspMqttClient`：`EspMqttClient::new` 返回
 //! `(client, connection)`，由一个专属线程持有 `connection` 并用阻塞的
@@ -90,8 +90,8 @@ fn publish_status(msg: &str) {
     }
 }
 
-/// CSI 近场感知通知（`csi/notify` 主题，QoS 1）：状态变化（1 米内有人↔无人）
-/// 时由 `csi_presence` 发布。经 API 工作线程执行（事件处理路径不可直接调用
+/// CSI 近场感知通知（`csi/notify` 主题，QoS 1）：approach（靠近）/ leave（离开）
+/// 事件由 `csi_presence` 发布。经 API 工作线程执行（事件处理路径不可直接调用
 /// client API）。
 pub fn publish_notify(msg: &str) {
     // MQTT 发送活动指示

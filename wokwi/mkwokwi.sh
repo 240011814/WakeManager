@@ -55,7 +55,9 @@ unset IDF_PATH
 LOG="$REPO_ROOT/.mkwokwi.log"
 {
     echo "=== $(date '+%F %T')  cmd=cargo build $RELEASE_FLAG $FEATURES_ARG  (cwd=$REPO_ROOT)"
-    env | grep -E '^(IDF|ESP|CARGO|MCU)' | sort | sed 's/^/    env: /'
+    # 环境里一个 IDF/ESP/CARGO/MCU 变量都没有时 grep 退出码非零，
+    # set -e + pipefail 会让脚本在 cargo 之前静默退出
+    { env | grep -E '^(IDF|ESP|CARGO|MCU)' || true; } | sort | sed 's/^/    env: /'
 } >> "$LOG"
 if ! (cd "$REPO_ROOT" && cargo build $RELEASE_FLAG $FEATURES_ARG) >> "$LOG" 2>&1; then
     echo "cargo build 失败！完整日志: $LOG" >&2
@@ -64,12 +66,18 @@ if ! (cd "$REPO_ROOT" && cargo build $RELEASE_FLAG $FEATURES_ARG) >> "$LOG" 2>&1
 fi
 tail -1 "$LOG"
 
-# 插件 Monitor 读工作区根 sdkconfig（取波特率）：软链悬空/缺失时自动重建
-# （esp-idf-sys 升级或换 target 后 hash 目录会变）
+# 插件 Monitor 读工作区根 sdkconfig（取波特率），这也被 esp-idf-sys 当作
+# defaults 链的最后一环：软链必须始终指向**最新一次构建**的 out/sdkconfig
+# （esp-idf-sys 升级或换 target 后 hash 目录会变；只查悬空/缺失会漏掉
+#  "仍可解析但指向旧 hash 目录" 的情况——旧值会悄悄覆盖 sdkconfig.defaults）
 SDKCONFIG_SRC=$(ls -td "$TARGET_DIR/xtensa-esp32s3-espidf/$PROFILE/build/esp-idf-sys-"*/out/sdkconfig 2>/dev/null | head -1)
-if [ -n "$SDKCONFIG_SRC" ] && [ ! -e "$REPO_ROOT/sdkconfig" ]; then
-    ln -sfn "$SDKCONFIG_SRC" "$REPO_ROOT/sdkconfig"
-    echo "修复 sdkconfig 软链 → $SDKCONFIG_SRC"
+if [ -n "$SDKCONFIG_SRC" ]; then
+    LINK_REAL=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$REPO_ROOT/sdkconfig" 2>/dev/null || true)
+    SRC_REAL=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$SDKCONFIG_SRC" 2>/dev/null || true)
+    if [ "$LINK_REAL" != "$SRC_REAL" ]; then
+        ln -sfn "$SDKCONFIG_SRC" "$REPO_ROOT/sdkconfig"
+        echo "修复 sdkconfig 软链 → $SDKCONFIG_SRC"
+    fi
 fi
 
 # esp-idf-sys 的 CMake 构建目录（取最新一次构建）

@@ -328,6 +328,22 @@ pub fn start() {
         let wifi_cfg = wifi_init_config_default();
         check(esp_wifi_init(&wifi_cfg), "esp_wifi_init");
 
+        // ---- 钉住 STA 上行速率 6 Mbps 传统 OFDM（CSI 探测链路稳定）----
+        // CSI 主帧源是 ping echo reply（下行帧，速率由 AP 决定）；上行钉 6M
+        // 只保证探测包时延抖动小、链路状态稳定。必须在 esp_wifi_start 之前
+        // 调用（IDF API 约束）；需 AMPDU_TX=n 才真正生效（sdkconfig 已关）。
+        if ac::CSI_TX_RATE_6M {
+            let err = esp_wifi_config_80211_tx_rate(
+                wifi_interface_t_WIFI_IF_STA,
+                wifi_phy_rate_t_WIFI_PHY_RATE_6M,
+            );
+            if err == ESP_OK {
+                ::log::info!("CSI: STA TX rate pinned to 6 Mbps OFDM (probe link steady)");
+            } else {
+                ::log::warn!("CSI: pin STA TX rate failed: {err:#x} (probe jitter may rise)");
+            }
+        }
+
         // ---- 模拟构建：跳过 BLE 配网（模拟器不支持蓝牙），直连模拟 AP ----
         #[cfg(feature = "sim")]
         {

@@ -92,7 +92,7 @@
 - **运行时配置**：所有参数经 NVS 持久化，可在网页上修改。
 - **设备唯一标识**：由 Wi-Fi STA MAC 生成 12 位十六进制 ID，用于 MQTT 寻址与发现。
 - **设备发现**：所有设备订阅同一个广播主题，远程无需预先知道设备 ID 即可先发现再操作。
-- **近场人体感知**：Wi-Fi CSI 近场遮挡近似探测 ~1 米内是否有人，状态变化时发 MQTT 通知（`csi/notify`）。
+- **近场人体感知**：Wi-Fi CSI 近场探测**靠近（approach）/ 离开（leave）两个事件**发 MQTT 通知（`csi/notify`）；不做有人/无人状态判定、无人工校准（ESPectre 运动内核 + 近场电平门引入 ~1m 范围，详见「Wi-Fi CSI 近场感知」）。
 - **BLE 配网**：基于 `espressif/network_provisioning`。
 
 技术栈：**Rust（`esp-idf-svc` std 路线 / ESP-IDF v6.1）**，目标芯片 **ESP32-S3**。原 C 实现已移除。
@@ -164,7 +164,8 @@ WakeManager/
     ├── ota.rs                  # OTA：GitHub Releases 版本检查 + 流式下载升级（esp_ota 双槽）
     ├── control_http.rs         # EspHttpServer（专属线程持有）+ 内嵌 index.html
     ├── control_mqtt.rs         # EspMqttClient + 事件循环线程 + API 工作线程
-    └── csi_presence.rs         # Wi-Fi CSI 近场人体感知（~1m 有人/无人，状态变化发 MQTT 通知）
+    ├── csi_features.rs        # CSI 特征流水线（湍流/自相关/IQR/Hampel/固定权重融合；参照 ESPectre 独立重实现）
+    └── csi_presence.rs         # Wi-Fi CSI 近场感知（靠近/离开事件发 MQTT 通知；探测流量 + 检测线程）
 ```
 
 托管组件（由 `Cargo.toml` 的 `extra_components` 声明）：`espressif/mqtt`、`espressif/network_provisioning`（后者还依赖 `espressif/json_generator`）。
@@ -213,19 +214,19 @@ WakeManager/
 - **广播地址自动推导**：`directed broadcast = (ip & netmask) | ~netmask`，用 STA 网卡 IP 与掩码计算，支持任意前缀长度；网卡无 IP 时回退 `255.255.255.255`。
 - API：`wol::send_to(mac, dest_ip)`、`send_str_to(mac_str, dest_ip)`、`get_default_broadcast()`。
 
-## Wi-Fi CSI 近场趋势探测（csi_presence）
+## Wi-Fi CSI 近场感知（csi_presence）
 
-`csi_presence.rs`（需 sdkconfig `CONFIG_ESP_WIFI_CSI_ENABLED=y`，已在 sdkconfig.defaults 开启）。**产品语义（2026-10 定稿）：只报两个事件，不做「有人/无人」状态判定、不做基线校准**：
+`csi_presence.rs` + `csi_features.rs`（需 sdkconfig `CONFIG_ESP_WIFI_CSI_ENABLED=y`，已在 sdkconfig.defaults 开启）。**产品语义（2026-10 定稿，范围=设备周围 ~1m）：只报两个事件，不做「有人/无人」状态判定、不做人工校准（近场基线为 60s 慢自适应窗中值）**：
 
-- **两个触发**：**`approach`（靠近）= ① 上升斜率 ≥+3%（快路径，带动作走近 ~2s）② 平滑水位 ≥ 空场地板 ×1.02 持续 3s（慢路径，安静坐下）**；**`leave`（离开）= 水位回到空场地板 ×1.015 持续 3s 且近 8s 内有活动**。三条真机教训：① 纯斜率判不了安静走近（实测水位 1~2 分钟慢慢爬升，3s 斜率仅 +0.003，拖 2 分钟才触发）→ 必须有水位慢路径；② 纯下降斜率会被坐着时的动作回落误触发（3~5s 交替跳变）→ 离开认「回到空场地板」；③ 坐着时水位偶尔下凹到空场水位（实测 level 19.1 vs 地板 19.2）→ 离开加**活动限定**（人离开必有行走动作，下凹是安静的）。地板 = 10 分钟滑动最小值自学习，无基线校准；**开机时人在设备旁会污染地板**（人真正离开一次后自动校正）。
-- **触发语义**：各方向每次趋势只发一条（交替触发防刷屏）+ 最小事件间隔 `CSI_TREND_REFRACTORY_MS`（15s）兜底。响应：靠近 ~2s（带动作）/ ~10s（安静坐下），离开 ~5s。热身 `CSI_TREND_WARMUP_MS`（5s）内不触发；开机首条 leave 免活动限定。水位平滑 `CSI_LEVEL_ALPHA`（τ≈1.7s）压掉动作毛刺。
-- **幅度度量 = 全段 RMS**（LLTF+HTLTF+STBC 混合；实测对活动最敏感，纯 LLTF 均值会把扰动削掉一半以上）。本机实测人体贴近是**幅度上升**（+5~10%）；换环境若贴近反而下降，两个事件语义互换。历史教训：形状距离方案在本机幅度量级（~10/127，int8 量化步长 ~10%）下被量化噪声淹没，已弃用。
-- **数据流**：CSI 回调（Wi-Fi 任务，只算幅度 RMS + 入环形缓冲，禁日志/分配）→ `csi_det` 检测线程（500ms 评估时长窗口 + 斜率）→ 趋势事件发 `csi/notify`。断流 30s 告警一次。
-- **帧率依赖主动探测流量（关键教训）**：CSI 只对 **OFDM/HT 速率**的帧生成，AP 的 beacon 走 802.11b/CCK 基本速率**不产生 CSI**——STA 静默时帧率只有 ~0.2 帧/秒；只关 Wi-Fi 省电（`esp_wifi_set_ps(WIFI_PS_NONE)`）**救不回来**。开机即：① 关省电；② **UDP 单播探测流量**打默认网关（`CSI_PROBE_INTERVAL_MS`=50ms → 20 包/s；每帧必被 AP MAC-ACK，`dump_ack_en` 下 ACK 帧出 CSI）；③ ICMP ping 网关（**100ms = 10 帧/s 保底**）——必须留兜底：UDP 的 ACK 在速率自适应落到 CCK 时会断流（实测 30s 空窗）。判定窗口按时长（`CSI_WINDOW_MS`=2s）不按帧数。
+- **判定两大件（2026-10-16 真机第二轮复盘后定稿）：ESPectre 轻量运动内核 + 近场电平门（范围控制）**。① 运动内核（参照 ESPectre 轻量检测器，Rust 独立重实现）：每帧把 12 个固定子载波（±4/±9/±14/±19/±24/±28）幅度折算成 std/mean（聚合湍流 = 相邻 5 bin 幅度均值后再 std/mean），Hampel（窗 7、5×MAD）去野值；1s 窗口算 **lag-1 自相关 + 聚合湍流 IQR/均值**，固定权重 logistic → 运动概率 p（`CSI_MOTION_THRESHOLD`=0.6622）。② **p 只作运动佐证**（行走/坐下必然连续超阈数秒；纯电平漂移不超阈）——纯 p 边沿触发在真机反复横跳（人走近一停步 p 秒塌 → 误发 leave，再动又 approach，实测 1~3s 一对事件），已废弃。③ **近场电平门**：窗口 RSSI 中值 vs 慢自适应「空场」基线（60s 环中值，只统计非近场时刻；向上 4dB/6s 快重锚；启动后首 8s 采样武装）的降幅 = 人体在 ~1m 内的近场吸收/遮挡（实测空场 -57~-58 dBm、1m 内 -62~-66 dBm，降 4~8dB；绝对电平量，湍流特征全为比值、天然对距离不敏感）。降幅 ≥`CSI_NEAR_ENTER_DB`(3.0) 保持 `CSI_NEAR_ENTER_HOLD_MS`(1.5s) + 佐证≥2 拍 → `approach`；回到 ≤`CSI_NEAR_EXIT_DB`(1.5) 保持 `CSI_NEAR_EXIT_HOLD_MS`(3s) + 佐证≥3 拍 → `leave`。**区状态翻转才发事件** → 区内静坐/打字不重复触发、不因停止运动误发 leave（电平没恢复），远处走动不触发（电平不动）。检测范围调 `CSI_NEAR_*` 常数（`CSI_NEAR_ENTER_DB` 越大范围越小）。融合权重/center/scale 在 `csi_features.rs`（拟合值勿改）。
+- **触发延迟**：approach ≈ 跨门后 1.5s（窗口 1s 平滑另加）；leave ≈ 电平恢复后 3s。未就绪的拍（帧不足）不推进计数——短暂断流不会把区状态关掉。基线未武装（启动后首 ~8s）不判定事件。
+- **数据流**：CSI 回调（Wi-Fi 任务：`rx_state` 质量门 → 时隙准入 → 每帧湍流特征，禁日志/分配）→ 环形缓冲 → `csi_det` 检测线程（Hampel → 1s 窗口 → 融合概率 p + 窗口 RSSI 中值 → 近场区状态机）→ 事件发 `csi/notify`。断流 30s 告警一次。热身 `CSI_WARMUP_MS`（3s）内不评估不触发（覆盖启动瞬时流量：SNTP/MQTT 连接）。
+- **帧率与速率（2026-10 真机实测后照抄 ESPectre 重做）**：CSI 只对 **OFDM/HT** 帧生成；实测本硬件（S3 + 该 AP）**上行帧的 ACK-CSI 一帧不出**（UDP 打网关 100pps 验证）——旧「UDP ACK 主帧源」退役。现方案：① **ICMP ping 100pps 主帧源**（`CSI_PING_INTERVAL_MS`=10ms；echo reply 是 AP 的下行 HT 帧，稳定出 CSI；ESPectre 默认 ping 流量模式同款，TOS 打 DSCP 46）；② CSI 采集配置同 ESPectre HT20 档——**只采 HT-LTF**（关 LLTF/STBC-HT-LTF2/合并/ACK dump/信道滤波），载荷固定 128B 全宽、与特征标定语料一致；③ sdkconfig 同 ESPectre：`AMPDU_TX/RX=n`（TX A-MPDU 会让速率钉定失效）、`FREERTOS_HZ=1000`（10ms 节拍精度）、`STA_DISCONNECTED_PM_ENABLE=n`；④ `wifi_prov` 仍在 `esp_wifi_start` **之前**钉 STA 上行 6 Mbps OFDM（`CSI_TX_RATE_6M`，链路稳定保障）。**时隙准入**（同一 10ms 时隙只准入第一帧）把不定帧率规整成拟合标定的 100pps 节拍。帧率异常用 5s 日志的 `rx=`/`drop(rs/slot/parse)` 分级计数定位。
+- **载荷归一化**（`csi_features.rs`）：兼容 128B 全宽 / 256B 双份取前 / 114B 短 HT 57SC / 228B / 106B 紧凑 LLTF 53SC；经典 MAC 芯片（ESP32/S3）原生 "0~31, -32~-1" 顺序（DC 在 bin 0）用保护带 null 证据判别后旋转半段到居中布局；LLTF 缺段（±27/±28）从最近的 ±26 补齐。布局/退化帧判不出直接丢帧。
 - **通知消息**（`WOL_MQTT_CSI_NOTIFY_TOPIC` = `csi/notify`，固定主题不追加设备 id，消息内含 `id`，QoS 1）：
-  `{"id":"...","cmd":"csi","event":"approach|leave","slope":0.052,"amp":20.3,"rs":0.11,"frames":1234}`。
-- **定期打印**：每 `CSI_LOG_INTERVAL_MS`（默认 5s，0 = 关闭）一行 `csi: last=... amp=... level=... floor=... slope=... rs=... rssi=... frames=...`——调参看 `level` 与 `floor` 的间距（坐着 ≈ +4%，空场 ≈ 0）和 `slope` 与 `CSI_TREND_ENTER` 的关系。`frames` 为**饱和计数**（u64，20 帧/s ≈ 290 亿年到顶，`saturating_add` 兜底防回绕）。
-- 串口 `csi` 查看实时量与判定规则。`DeviceStatus.presence` 为兼容视图（最近事件 approach → `present`，其余 `absent`），权威输出是 `csi/notify` 的趋势事件。
+  `{"id":"...","cmd":"csi","event":"approach|leave","p":0.83,"ac":0.42,"iqr":0.31,"turb":0.15,"frames":1234}`。
+- **定期打印**：每 `CSI_LOG_INTERVAL_MS`（默认 5s，0 = 关闭）一行 `csi: state=in|out drop=±dB base=... rssi_med=... p=... ac=... iqr=... turb=... n=... len=... frames=... rx=... drop(rs=... slot=... parse=...)`——调范围看 `drop` 与 `CSI_NEAR_*_DB` 的关系（空场 drop≈0，人近 drop 为正、3~8dB），调灵敏度看 p 与阈值；`n` 为窗口样本数、`len` 为最近一帧载荷长度（帧型诊断）；`rx`/`drop(rs/slot/parse)` 为回调入口帧数与各级丢弃计数（帧率排查）。`frames` 为**饱和计数**（u64，`saturating_add` 兜底防回绕）。
+- 串口 `csi` 查看实时量与判定规则。`DeviceStatus.presence` 为兼容视图（最近事件 approach → `present`，其余 `absent`），权威输出是 `csi/notify` 事件。
 
 ## HTTP 接口
 
@@ -234,7 +235,7 @@ WakeManager/
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | 内嵌单页 UI |
-| GET | `/api/status` | 状态 JSON：`id`、`ip`、`ssid`、`rssi`、`heap`、`mqtt_connected`、`broadcast`、`mac_count`、`presence`（1 米内有人/无人）、`temp_c`、`time`、`version`、`ota`（OTA 状态机） |
+| GET | `/api/status` | 状态 JSON：`id`、`ip`、`ssid`、`rssi`、`heap`、`mqtt_connected`、`broadcast`、`mac_count`、`presence`（兼容视图：最近事件 approach→present，否则 absent）、`temp_c`、`time`、`version`、`ota`（OTA 状态机） |
 | GET | `/api/config` | 当前配置 JSON |
 | POST | `/api/config` | 保存配置（`x-www-form-urlencoded`），随后重载 MQTT |
 | GET | `/api/wake` | 发送魔术包，**`?mac=<MAC>` 必传**，可选 `?ip=<IP>` |
@@ -273,7 +274,7 @@ WakeManager/
    - 查状态：`{"cmd":"status"}` → 发布设备状态快照（含 `version` 与 `ota` 状态机）。
    - check/upgrade 只做触发（检查/下载在 OTA 专属 32KB 栈线程跑），进行中重复触发会回 `error: OTA 正在进行中`。
 
-**发布：** 命令结果、发现应答、地址簿列表发布到 `WOL_MQTT_STATUS_TOPIC`（`status`）。芯片温度仅在按需发布的状态快照（`temp_c` 字段）中返回。CSI 近场感知的状态变化通知发布到 `WOL_MQTT_CSI_NOTIFY_TOPIC`（`csi/notify`，见「Wi-Fi CSI 近场人体感知」）。
+**发布：** 命令结果、发现应答、地址簿列表发布到 `WOL_MQTT_STATUS_TOPIC`（`status`）。芯片温度仅在按需发布的状态快照（`temp_c` 字段）中返回。CSI 近场感知的靠近/离开事件发布到 `WOL_MQTT_CSI_NOTIFY_TOPIC`（`csi/notify`，见「Wi-Fi CSI 近场感知」）。
 
 **指示灯：** `led_status` 在 MQTT **收发数据**时使 LED 快速闪烁约 **2 秒**，随后自动恢复到闪烁前由 `set()` 设定的状态（连接中慢闪 / 已连接常亮）。
 
@@ -327,12 +328,14 @@ WakeManager/
 - **SNTP**：现在走 esp-idf-svc 的 `EspSntp`（server 字符串生命周期由句柄托管，`main()` 保活）；时区仍用 `setenv("TZ", ...)` + `tzset()`（0.53 的 `SntpConf` 无 timezone 字段）。
 - **分区表**：`partitions.csv`（OTA 双槽布局）通过 `CONFIG_PARTITION_TABLE_CUSTOM=y` 编进构建；esp-idf-sys 的限制是**相对路径被解析到 cargo OUT_DIR**，`CUSTOM_FILENAME` 必须是绝对路径——写成 CMake 的 `"$ENV{PROJECT_DIR}/partitions.csv"`（esp-idf-sys 构建时始终把环境变量 `PROJECT_DIR` 设为 Cargo 工作区根目录，换机器不用改）。**不要用 `${PROJECT_PATH}`**：它只在 `project.cmake` 的 `__project_info()` 里有定义，而生成 `PARTITION_CSV_PATH` 的 `build.cmake` include sdkconfig.cmake 处变量为空，会退化成 `/partitions.csv`。flash size 相应设为 8MB。
   另注：esp-idf-sys 会把 `target/<triple>/<profile>/build/esp-idf-sys-*/out/sdkconfig` 作为**最后一个** defaults 文件传入（优先级最高），改 sdkconfig.defaults 时若该文件里已有旧值，需一并改掉或删除，否则不生效。
+  经验（2026-10 修复两处相关陷阱）：① **优化级别 `CONFIG_COMPILER_OPTIMIZATION_SIZE=y`（-Os）此前只存在于 out/sdkconfig 残留**（历史 menuconfig 设定），清缓存全量重建会静默回落 Kconfig 默认 `-Og`（固件大 ~115KB）——现已固化进 `sdkconfig.defaults`；② 工作区根 `sdkconfig` 软链**必须指向最新构建的 hash 目录**——esp-idf-sys 升级/换 target 后 hash 目录会变，旧逻辑只查「悬空/缺失」，漏掉「仍可解析但指向旧目录」的情况（旧文件的旧值仍会进 defaults 链，覆盖/补入意外值）→ `mkwokwi.sh` 已改为用 realpath 比对、每次运行校验并重链；③ 核对方法：`diff <(grep -v '^#' 旧out/sdkconfig|sort) <(grep -v '^#' 新out/sdkconfig|sort)` 一眼看清有意/意外差异（本次即靠它查出优化级别回归）。
 - **Windows 构建目录**：esp-idf-sys 要求 canonicalize 后的 OUT_DIR ≤ 88 字符；`target` 是指向短路径（`D:\espbuild`）的 NTFS junction——产物在项目内可见、检查时解析回短路径。换机器需重建 junction（`New-Item -ItemType Junction`），不能用 subst（canonicalize 会还原成原长路径）。
+- **IDF 双拷贝的 CMake 缓存陷阱**：本机存在两份同版本 IDF（`~/.espressif/esp-idf/v6.1` 与 `~/.espressif/v6.1/esp-idf`）。构建时环境里若带着 `IDF_PATH` 指向其中一份，esp-idf-sys 的 CMake 缓存就绑死那份路径，之后换另一份（哪怕只是路径字符串不同）重建 → `bootloader ... does not match the source ... used to generate cache` 直接失败。`mkwokwi.sh` 开头的 `unset IDF_PATH` 让构建稳定发现 `~/.espressif/esp-idf/v6.1`——**别在设置了指向另一份拷贝的 IDF_PATH 的终端里直接 `cargo build`**。缓存已污染时：删掉 `target/xtensa-esp32s3-espidf/*/build/esp-idf-sys-*/out/build` 与同目录 `esp-idf-build.json`，按 `mkwokwi.sh` 方式（无 IDF_PATH）全量重建一次即恢复。
 - **NVS 全新 flash 首启**：只读 `EspNvs::new(..., false)` 在命名空间不存在时返回 `ESP_ERR_NVS_NOT_FOUND`，`config_store`/`mac_store` 的 `init` 必须按"无存储配置"处理而非上抛（此 bug 由 Wokwi 模拟发现——真机全擦后首启会 abort 重启循环）。
 - **Wokwi 模拟**：不支持 BLE → `sim` feature 跳过配网直连 `Wokwi-GUEST`；`wokwi/wokwi.toml` 不要设 `gdbServerPort`（会暂停仿真等 GDB）；esp-idf-sys 的 CMake 产物 `libespidf.bin` 不含 Rust 代码，模拟镜像必须用 cargo elf 经 `esptool elf2image` 转换（`wokwi/mkwokwi.sh`）；Wokwi 相关文件（`wokwi.toml`/`diagram.json`/`mkwokwi.sh`/产物 `build/`）统一在 `wokwi/` 子目录，Wokwi 扩展按 `**/wokwi.toml` 递归识别。
 - **烧录 + 监视的正确姿势**：`cargo build` → `cargo espflash flash --monitor`（或 `cargo run`，runner 已配好）；**插件按钮也已打通**——`.vscode/settings.json` 配了 `idf.preFlashTask: ./wokwi/mkwokwi.sh --real`，点插件 Flash 会自动 cargo build（真机）+ 组装根 `build/`（`flasher_args.json`/`project_description.json`/`wol-rs.elf`/`wol-rs.bin`）再烧录，Monitor 用其中的 `project_description.json` 定位 elf、用根 sdkconfig 软链读波特率。`wokwi/build/` 是 sim 镜像，别拿去烧真机。**串口同时只能一个进程打开**：残留的 espflash/monitor 会话会让插件烧录、端口检测报 `Resource busy` / `Failed to detect the default serial port`（先 `lsof /dev/cu.usbmodem*` 排查）。
 - **OTA 双槽的烧录陷阱**：app 永远烧进 ota_0（0x20000），但**启动哪个槽由 otadata**（0xf000/0x2000）决定——OTA 升级过的设备 otadata 指向另一槽（如 ota_1），只烧 ota_0 重启后跑的还是旧的下载版（"烧录后还是跑下载的版本"）。两条烧录链路都已重置启动槽：runner 带 `--erase-parts otadata`；`mkwokwi.sh` 生成的 `flasher_args.json` 带空白 `otadata.bin`（全 0xFF）写入 0xf000。手动 esptool 烧录记得先 `esptool.py --chip esp32s3 erase-region 0xf000 0x2000`（app 偏移是 0x20000，不是老 factory 布局的 0x10000）。
-- **ESP-IDF 插件（VS Code）**：idf.py Build/menuconfig 对 Rust 工程不适用（无根 CMakeLists.txt）；**Monitor 可用**——工作区根的 `sdkconfig` 是指向 `target/.../esp-idf-sys-*/out/sdkconfig` 的软链（esp-idf-sys 升级后悬空需重建，见 README 命令）；**调试**用 `.vscode/launch.json` 的 "wol-rs: USB-JTAG 调试（ESP32-S3）"（`gdbtarget` + `runOpenOCD`，本机配置不入库），**`request` 必须是 `attach`**——`launch` 模式适配器会自己 spawn `gdbserver` 当被调试端（ESP32 没这个程序 → `spawn gdbserver ENOENT`），attach 才是连 OpenOCD 的 3333 端口、由 `runOpenOCD` 自动拉起 OpenOCD；调试前先 `pkill -f openocd` 清掉占 3333 端口的残留实例。
+- **ESP-IDF 插件（VS Code）**：idf.py Build/menuconfig 对 Rust 工程不适用（无根 CMakeLists.txt）；**Monitor 可用**——工作区根的 `sdkconfig` 是指向 `target/.../esp-idf-sys-*/out/sdkconfig` 的软链（esp-idf-sys 升级/换 target 后 hash 目录会变；`mkwokwi.sh` 每次运行会校验并重链到最新构建目录，不再依赖「悬空才重建」）；**调试**用 `.vscode/launch.json` 的 "wol-rs: USB-JTAG 调试（ESP32-S3）"（`gdbtarget` + `runOpenOCD`，本机配置不入库），**`request` 必须是 `attach`**——`launch` 模式适配器会自己 spawn `gdbserver` 当被调试端（ESP32 没这个程序 → `spawn gdbserver ENOENT`），attach 才是连 OpenOCD 的 3333 端口、由 `runOpenOCD` 自动拉起 OpenOCD；调试前先 `pkill -f openocd` 清掉占 3333 端口的残留实例。
 - **clangd 编译数据库**：`bindings.h` 里的 ESP-IDF 头文件（`esp_chip_info.h` 等）include 路径来自 esp-idf-sys 的 CMake 构建，clangd 无从得知 → 编辑器报 `'esp_chip_info.h' file not found`（**不是构建错误**，`cargo build` 不受影响）。`build.rs` 每次构建从最新 `esp-idf-sys-*/out/build/compile_commands.json` 提取全部 `-I`/`-D`（含托管组件），用真实编译命令探测工具链隐式目录（**必须用真实命令**：裸跑 `gcc -E -Wp,-v` 拿不到 picolibc 目录，`stdio.h` 会链断在 `__FILE`），补上两个托管组件守卫宏，为 `bindings.h` 合成一条条目写到 `target/clangd-db/compile_commands.json`（`.vscode/settings.json` 的 `--compile-commands-dir` 指向它）。不能放仓库根 `build/`——`mkwokwi.sh --real` 每次 `rm -rf` 它。`cargo clean` 后重新 `cargo build` 即恢复；VS Code 里 clangd 报旧缓存时执行 "clangd: Restart language server"。
 - **PSRAM（8MB，立创 ESP32S3R8N8 octal）**：sdkconfig.defaults 开 `CONFIG_SPIRAM=y + MODE_OCT + SPEED_80M + USE_MALLOC`——大分配（JSON/OTA 下载缓冲等）自动落 PSRAM（> `SPIRAM_MALLOC_ALWAYSINTERNAL` 4096 字节），缓解内部 RAM 压力；任务栈仍固定内部 RAM（见 MQTT 生命周期条）。`CONFIG_SPIRAM_IGNORE_NOTFOUND=y` 保 Wokwi 模拟（无 PSRAM）不 panic 只降级（Wi-Fi/LWIP 缓冲退回无 PSRAM 默认值）。
 - **启动提速三件套（2026-10 提速参考核查）**：① PHY 部分校准**已默认满足**——`CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=y` + `ESP_PHY_CALIBRATION_MODE=0`（RF_CAL_PARTIAL，全校准只发生在首启/NVS 擦除后）；② CSI 帧率靠主动探测流量（见 CSI 章节），不是等 beacon；③ Flash 四线 `CONFIG_ESPTOOLPY_FLASHMODE_QIO=y`（约快一倍；**烧录字符串仍是 "dio"**——bootloader 烧录时走 DIO 再自升级四线，`ESPTOOLPY_FLASHMODE_VAL`=1 才是运行时模式，两者按 Kconfig 推导别手改）+ Rust `profile.dev opt-level = "2"`。**QIO 恢复路径**：若 flash/板子不支持四线导致开机不启动，改回 `CONFIG_ESPTOOLPY_FLASHMODE_DIO=y` 串口重烧即恢复（VAL 改回 3）；换 sdkconfig 同时要清 out/sdkconfig 旧值（choice 冲突会让 Kconfig 选择混乱，见分区表条）。

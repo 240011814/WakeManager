@@ -65,65 +65,92 @@ pub const OTA_ASSET_NAME: &str = "wol-rs.bin";
 pub const OTA_CHECK_URL: &str = "https://api.github.com/repos/240011814/WakeManager/releases/latest";
 
 
-/* ---------- Wi-Fi CSI 近场趋势探测（csi_presence） ----------
- * 产品语义（2026-10 定稿）：**只报两个事件**——幅度上升趋势 = 靠近
- * （approach），下降趋势 = 离开（leave）；不做「有人/无人」状态判定、
- * 不做基线校准。趋势 = 当前平滑幅度 vs N 秒前的相对变化，天然免疫慢漂移。 */
+/* ---------- Wi-Fi CSI 近场感知（csi_presence） ----------
+ * 产品语义（2026-10 定稿，范围=设备周围 ~1m）：**只报两个事件**——approach
+ * （靠近）/ leave（离开）；不做「有人/无人」状态判定、不做人工基线校准。
+ * 判定 = ESPectre 轻量运动内核（见 csi_features.rs）+ **近场电平门**（本
+ * 产品特有：ESPectre 是全屋运动感应、没有距离概念；近场门用 RSSI 相对慢
+ * 自适应基线的降幅引入「~1m 范围」——人体近场吸收/遮挡造成绝对电平下降，
+ * 真机实测空场 -57~-58 dBm、1m 内 -62~-66 dBm）：
+ *   - 运动内核：湍流特征 → 1s 窗口（lag-1 自相关 + IQR/均值）→ logistic
+ *     融合 p；p 只作**运动佐证**（行走/坐下必然连续超阈数秒），不单独定事件；
+ *   - 近场区状态机：降幅 ≥ENTER 保持 ENTER_HOLD + 佐证 → approach（进区）；
+ *     降幅回到 EXIT 内保持 EXIT_HOLD + 佐证 → leave（出区）；区状态翻转才
+ *     发事件 → 区内坐着/打字不重复触发、不因停止运动误发 leave；远处走动
+ *     电平不动 → 不触发。一拍 = CSI_EVAL_INTERVAL_MS。 */
 
-/// 检测线程评估周期（ms）
-pub const CSI_EVAL_INTERVAL_MS: u64 = 500;
-/// 判定窗口时长（ms）：最近 2s 帧的幅度均值/波动（**时长窗口**，帧率无关）
-pub const CSI_WINDOW_MS: u64 = 2_000;
-/// 窗口最少样本数（不足不判定；探测流量异常低时防误判）
-pub const CSI_WINDOW_MIN_FRAMES: usize = 8;
-/// 帧历史上限（FrameStat 约 16B/帧）
+/// 检测线程评估周期（ms）：一拍 = 250ms（ESPectre 生产配置）
+pub const CSI_EVAL_INTERVAL_MS: u64 = 250;
+/// 判定窗口时长（ms）：最近 1s 的准入样本（≈100 样本，对齐拟合标定）
+pub const CSI_WINDOW_MS: u64 = 1_000;
+/// 窗口最少样本数（不足不判定；探测流量偏低时防误判）。目标 100pps 下
+/// 窗口 ≈ 100 样本；下限 20 是「帧率打折也别停判定」的兜底（现场实测
+/// 曾因下限 40 > 实际 20 帧/s 而整场不评估）
+pub const CSI_WINDOW_MIN_FRAMES: usize = 20;
+/// 帧历史上限（FrameStat 约 24B/帧）
 pub const CSI_HIST_CAP: usize = 256;
-/// 趋势斜率比较间隔（ms）：slope = (当前平滑幅度 − N ms 前的值) / N ms 前的值
-pub const CSI_TREND_WINDOW_MS: u64 = 3_000;
-/// 判定「靠近」的斜率阈值：≥ +3%（带动作走近/动作峰的**快路径**，2s 内触发）
-pub const CSI_TREND_ENTER: f32 = 0.03;
-/// 斜率快路径需连续达标时长（ms，防抖）
-pub const CSI_TREND_SUSTAIN_MS: u64 = 1_000;
-/// 判定「靠近」的**水位路径**：平滑水位 ≥ 空场地板 ×(1+MARGIN) 持续达标。
-/// 2%——安静走近/坐下时水位是 1~2 分钟慢慢爬升的（实测每 3s 斜率仅 +0.003，
-/// 纯斜率判据拖 2 分钟才触发，真机教训），必须有水位路径
-pub const CSI_APPROACH_MARGIN: f32 = 0.02;
-/// 判定「靠近」水位路径需连续达标时长（ms）
-pub const CSI_APPROACH_SUSTAIN_MS: u64 = 3_000;
-/// 判定「离开」的水位阈值（迟滞带 [1.5%, 2%]）：平滑水位回落到空场地板 ×(1+MARGIN)
-/// 以内。坐着的人静止水位只比空场高 ~4%、动作峰 +10~30%——纯下降斜率会被坐着时的
-/// 动作回落误触发（3~5s 交替跳变教训），必须认「回到空场水位」
-pub const CSI_LEAVE_MARGIN: f32 = 0.015;
-/// 判定「离开」需连续达标时长（ms，防抖）
-pub const CSI_LEAVE_SUSTAIN_MS: u64 = 3_000;
-/// 判定「离开」还要求近 N ms 内有**活动**（rs ≥ CSI_MOTION_RS 或 |slope| ≥ 2%）：
-/// 人离开必有行走动作；坐着时的水位下凹（实测可凹到空场水位）是安静的——
-/// 活动限定才不会把下凹误报成离开（真机跳变教训）。开机首条 leave 免此要求
-pub const CSI_LEAVE_MOTION_MS: u64 = 8_000;
-/// 活动判定的 rs 阈值（std/amp）
-pub const CSI_MOTION_RS: f32 = 0.05;
-/// 空场地板 = 最近 N ms 平滑水位的**最小值**（滑动窗口；环境慢漂靠窗口滑出吸收。
-/// 开机时人在设备旁会污染地板，人真正离开一次后自动校正）
-pub const CSI_FLOOR_WINDOW_MS: u64 = 600_000;
-/// 水位平滑系数（每评估周期 0.25 → τ≈1.7s，压掉动作毛刺保留水位）
-pub const CSI_LEVEL_ALPHA: f32 = 0.25;
-/// 事件最小间隔（ms，双方向共用；兜底残留跳变场景的连发）
-pub const CSI_TREND_REFRACTORY_MS: u64 = 15_000;
-/// 开机热身（ms）：忽略起始波动，同时覆盖斜率历史积累（比较需要 3s 历史）
-pub const CSI_TREND_WARMUP_MS: u64 = 5_000;
+/// 运动概率阈值（ESPectre 轻量检测器拟合默认值 0.6622；现仅作运动佐证）
+pub const CSI_MOTION_THRESHOLD: f32 = 0.662_185_45;
+/// 近场门进入阈值（dB）：窗口 RSSI 中值比慢基线低这么多 → 判「近场」。
+/// 真机实测：空场 -57~-58 dBm，人走近 1m 内 -62~-66（降 4~8dB）；3.0 =
+/// 约 1~1.5m 的保守门槛（物理检测范围直接由此调）
+pub const CSI_NEAR_ENTER_DB: f32 = 3.0;
+/// 近场门退出阈值（dB）：降幅回到这个值以内 → 判「已离开近场」；
+/// 与进入阈值间留 1.5dB 滞后带防边界抖动
+pub const CSI_NEAR_EXIT_DB: f32 = 1.5;
+/// 进入保持时长（ms）：降幅连续保持这么久才确认 approach
+pub const CSI_NEAR_ENTER_HOLD_MS: u64 = 1_500;
+/// 退出保持时长（ms）：电平恢复到基线附近持续这么久才确认 leave
+pub const CSI_NEAR_EXIT_HOLD_MS: u64 = 3_000;
+/// 运动佐证拍数（最近 CSI_NEAR_MOTION_MEMORY_TICKS 拍内 p 超阈的拍数）：
+/// approach 需 ≥2、leave 需 ≥3 拍——纯电平漂移（AP 功率/AGC 阶跃）不带
+/// 运动证据不误报；真行走的 p 连续高企数秒（实测 0.7~1.0），远超门槛
+pub const CSI_NEAR_ENTER_MOTION_TICKS: u32 = 2;
+pub const CSI_NEAR_EXIT_MOTION_TICKS: u32 = 3;
+/// 运动佐证记忆长度（拍）：32 拍 = 8s
+pub const CSI_NEAR_MOTION_MEMORY_TICKS: u32 = 32;
+/// 基线环长度（拍，1 拍 = CSI_EVAL_INTERVAL_MS）：每拍一个 1s 窗口 RSSI
+/// 中值样本；240 拍 = 60s 慢自适应「空场」参考电平，只统计非近场时刻
+/// （近场吸收样本不污染基线）
+pub const CSI_BASE_RING_LEN: usize = 240;
+/// 基线就绪所需最少样本（拍）：32 拍 = 8s；未就绪不判定事件
+pub const CSI_BASE_MIN_TICKS: usize = 32;
+/// 基线向上快重锚（dB / ms）：RSSI 比基线高 4dB 持续 6s（人离开后基线仍
+/// 停在占用期电平、或 AP 功率上调）→ 清环以当前电平重锚。只向上——向下
+/// 重锚会把已经在近场的人吞进基线导致漏报
+pub const CSI_BASE_SNAP_UP_DB: f32 = 4.0;
+pub const CSI_BASE_SNAP_UP_MS: u64 = 6_000;
+/// Hampel 去野值窗宽（样本数，有效范围 3..11）
+pub const CSI_HAMPEL_WINDOW: usize = 7;
+/// Hampel 判野值阈值（×MAD×1.4826）
+pub const CSI_HAMPEL_THRESHOLD: f32 = 5.0;
+/// 开机热身（ms）：窗口填充 + 启动瞬时流量（SNTP/MQTT 连接）抑制，
+/// 热身期内不评估、不触发事件
+pub const CSI_WARMUP_MS: u64 = 3_000;
+/// 帧准入时隙（µs）：同一时隙只准入第一帧——把不定帧率规整成拟合节拍
+/// 100pps（检测器常数按 100pps/1s 窗口标定）
+pub const CSI_ADMIT_SLOT_US: i64 = 10_000;
 /// CSI 数据断流告警阈值（ms 无新帧告警一次：Wi-Fi 空闲或 CSI 被关闭）
 pub const CSI_STALL_WARN_MS: u64 = 30_000;
-/// CSI 探测流量（ping 网关）间隔（ms）：echo reply 走 HT 速率**必出** CSI，是
-/// 稳定帧源的兜底（UDP 探测的 ACK 在速率自适应落到 CCK 时会断流，实测 30s 空窗）；
-/// 100ms = 10 帧/s 保底
-pub const CSI_PING_INTERVAL_MS: u32 = 100;
-/// CSI 探测 UDP 流量间隔（ms）：向默认网关单播小包，**每帧必被 AP MAC 层 ACK**
-///（dump_ack_en 下 ACK 帧出 CSI），速率稳定、不依赖对端回应/ICMP 策略；
-/// 50ms = 20 包/s（参考方案的 50~100 包/s 是双设备对发场景，单设备经 AP 回程
-/// 20 包/s 已给足 2s 窗口 ~40 样本）
-pub const CSI_PROBE_INTERVAL_MS: u64 = 50;
-/// 定期打印间隔（ms）：每 5s 打一行当前基线与测量值，现场观察检测量/调阈值用；
-/// 0 = 关闭定期打印（状态变化日志不受影响）
+/// CSI 探测 ping 间隔（ms）：**主帧源**——ICMP echo reply 是 AP 发的下行
+/// HT 帧，稳定出 CSI；10ms = 100 包/s，对齐检测器 100pps/1s 窗口标定。
+/// 目标 = 默认网关（拿不到时退公共 DNS）。ESPectre 默认 ping 流量模式同款；
+/// 旧「UDP 打网关靠 AP ACK 出 CSI」方案在本硬件实测一帧不出（上行 ACK-CSI
+/// 不可靠），已弃用
+pub const CSI_PING_INTERVAL_MS: u32 = 10;
+/// CSI 探测 ping 单包等待回应超时（ms）：`esp_ping` 是「发一包→同步等回应」
+/// 结构，丢一个回应会按 timeout 阻塞整条节拍（1000ms 默认值 = 丢一包空窗
+/// 1 秒）；压到 100ms：正常 LAN RTT 约几 ms 不受影响，丢包最多停 10 拍
+pub const CSI_PING_TIMEOUT_MS: u32 = 100;
+/// 探测流量 IP TOS（DSCP 46/EF，要求 WMM 高优先队列；ESPectre 同款，
+/// 网关可能忽略，尽力而为不致命）
+pub const CSI_PING_TOS: i32 = 46 << 2;
+/// 钉住 STA 上行速率 6 Mbps 传统 OFDM（在 wifi_prov 的 esp_wifi_start 之前
+/// 应用）：保持上行链路 OFDM/低速率稳定（探测包时延抖动小）；主帧源是下行
+/// echo reply，此钉定只作链路稳定保障（ESPectre 的 6Mbps 档同款选项）
+pub const CSI_TX_RATE_6M: bool = true;
+/// 定期打印间隔（ms）：每 5s 打一行当前测量值，现场观察检测量/调阈值用；
+/// 0 = 关闭定期打印（事件日志不受影响）
 pub const CSI_LOG_INTERVAL_MS: u64 = 5_000;
 
 /* ---------- Address book ---------- */

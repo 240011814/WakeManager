@@ -11,6 +11,7 @@ mod chip_temp;
 mod config_store;
 mod control_http;
 mod control_mqtt;
+mod csi_features;
 mod csi_presence;
 mod debug_uart;
 mod device_info;

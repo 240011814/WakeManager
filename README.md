@@ -76,7 +76,7 @@ cargo espflash flash --monitor                 # 自定义分区表已编进构�
 | --- | --- | --- |
 | `help` | `cmd` / `menu` / `?` | 返回命令菜单 |
 | `status` | `st` | 设备状态文本（与 `/api/status` 同一份数据）：id/ip/ssid/rssi/heap/mqtt/broadcast/macs/presence/temp/time |
-| `csi` | — | CSI 趋势探测实时量：last（none/approach/leave）/amp/level/floor/slope/rs/rssi/frames；approach = 靠近（斜率快路径 + 水位慢路径），leave = 离开（水位回空场地板 + 近期有活动），各方向每次趋势只发一条通知 |
+| `csi` | — | CSI 近场感知实时量：state（idle/motion）/last（none/approach/leave）/p/ac/iqr/turb/rssi/frames；内核 = 12 子载波湍流 lag-1 自相关 + 五 bin 聚合湍流 IQR 的固定权重融合概率（参照 ESPectre 轻量检测器独立重实现），p 连续超阈值 4 拍→approach（靠近）、连续回落 3 拍→leave（离开），每次事件发一条通知 |
 | `wifi-clear` | `reset-wifi` | 清除 NVS 里的 Wi-Fi 配置（SSID/密码）→ 回复确认 → 300ms 后重启 → 开机检测到未配网，自动重新进入 BLE 配网（App 扫日志里的 QR / PoP）。**破坏性操作，设备需重新配网才能联网** |
 
 示例（在串口终端里发 `help` / `status`）：
@@ -86,7 +86,7 @@ cargo espflash flash --monitor                 # 自定义分区表已编进构�
 ==== WakeManager 串口命令 ====
 help         显示本菜单
 status       查看设备状态
-csi          查看 CSI 趋势探测状态（approach=靠近 / leave=离开）
+csi          查看 CSI 近场感知状态（approach=靠近 / leave=离开）
 wifi-clear   清除 Wi-Fi 配置并重新进入配网模式（设备将重启）
 
 > status
@@ -223,5 +223,6 @@ bindings_header = "bindings.h"   # #include network_provisioning/{manager,scheme
     ├── index.html          # 内嵌单页 Web UI（原 components/wol_http/index.html）
     ├── control_http.rs     # EspHttpServer（index.html include_str 内嵌）
     ├── control_mqtt.rs     # EspMqttClient::new + 事件循环线程 + API 工作线程
-    └── csi_presence.rs     # Wi-Fi CSI 近场人体感知（~1m 有人/无人，状态变化发 MQTT 通知）
+    ├── csi_features.rs     # CSI 特征流水线（湍流/自相关/IQR/Hampel/融合；参照 ESPectre 独立重实现）
+    └── csi_presence.rs     # Wi-Fi CSI 近场感知（靠近/离开事件，发 MQTT 通知）
 ```

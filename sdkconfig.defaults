@@ -11,6 +11,13 @@ CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
 # `std::thread::Builder::new().stack_size(XXX)` for spawning
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
 
+# --- WakeManager: 编译器优化级别 -Os ---
+# 该设定历史上只存在于 out/sdkconfig（menuconfig 改的），清缓存全量重建时会
+# 悄悄回落默认 -Og（固件大 ~115KB、无收益）——2026-10 固化进 defaults。
+# 现代 choice 名为 COMPILER_OPTIMIZATION_SIZE（-Os），旧符号 LEVEL_RELEASE
+# 由 kconfig 自动镜像，无需手写。
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
 # --- WakeManager: BLE 配网传输层：NimBLE host ---
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
@@ -39,6 +46,17 @@ CONFIG_SPIRAM_IGNORE_NOTFOUND=y
 # CSI 每收到一帧（AP beacon/下行帧）回调一次；额外占用约
 # CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM KB RAM
 CONFIG_ESP_WIFI_CSI_ENABLED=y
+# 以下配置照抄 ESPectre 的 sdkconfig.defaults（感知硬件配置同款）：
+# - 关 A-MPDU TX：否则 esp_wifi_config_80211_tx_rate 的速率钉定被驱动忽略
+#   （回退自动速率）；- 关 A-MPDU RX：下行帧逐个出 CSI、粒度一致；
+# - FreeRTOS 1000Hz tick：10ms（100pps）探测节拍精度（默认 100Hz 只能以
+#   10ms 粒度调度）。
+# （ESPectre 还关断连省电 STA_DISCONNECTED_PM_ENABLE——本项目 BLE 配网启用
+#   esp_coex 软共存，该符号被其 select 强制 y，无法在 sdkconfig 关闭；
+#   连接后感知依赖运行期 WIFI_PS_NONE，不受影响。）
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+CONFIG_FREERTOS_HZ=1000
 
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="$ENV{PROJECT_DIR}/partitions.csv"

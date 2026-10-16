@@ -6,7 +6,7 @@
 //! 命令集（先支持两个需求）：
 //!   help        命令菜单
 //!   status      设备状态查看
-//!   csi         CSI 趋势探测状态查看（approach=靠近 / leave=离开）
+//!   csi         CSI 近场感知状态查看（approach=靠近 / leave=离开）
 //!   wifi-clear  清除 Wi-Fi 配置（SSID/密码）→ 重启 → 开机自动进 BLE 配网
 //!
 //! 扩展方式：在 `handle()` 的 match 里加分支 + 菜单里加一行即可。
@@ -21,7 +21,7 @@ const MENU: &str = "\
 ==== WakeManager 串口命令 ====
 help         显示本菜单
 status       查看设备状态
-csi          查看 CSI 趋势探测状态（approach=靠近 / leave=离开）
+csi          查看 CSI 近场感知状态（approach=靠近 / leave=离开）
 wifi-clear   清除 Wi-Fi 配置并重新进入配网模式，完成后设备将重启";
 
 /// 回写一行到串口（自动补 CRLF 并等 TX 排空，下一条响应不会插队）
