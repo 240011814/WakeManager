@@ -1,0 +1,14 @@
+{
+  "project_name": "wol-rs",
+  "project_version": "1.0.0",
+  "project_path": "/home/runner/work/WakeManager/WakeManager",
+  "build_dir": "/home/runner/work/WakeManager/WakeManager/build",
+  "config_file": "/home/runner/work/WakeManager/WakeManager/sdkconfig",
+  "config_defaults": "/home/runner/work/WakeManager/WakeManager/sdkconfig.defaults",
+  "bootloader_elf": "bootloader/bootloader.elf",
+  "app_elf": "wol-rs.elf",
+  "app_bin": "wol-rs.bin",
+  "build_type": "release",
+  "version": "v6.1",
+  "config_environment": {}
+}

@@ -1,0 +1,8 @@
+35c6a1bf66e3b8b402f0ddefa8aa20e642cc9d0d57f2ee0cc78b91b70ac813e5  ./bootloader/bootloader.bin
+1fc94380696e80db57825726d365b26bdb8d50b233f120c4709fc7c9a7afb0b4  ./bootloader/bootloader.elf
+0a1ac87ef67c2fe4f4e0220048af95f37a30cedab62d7cbc94f8cf23e7a7391c  ./flasher_args.json
+7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f  ./otadata.bin
+d06494a0c34aab167445b03c73461010550b12106fd0105fcbbcfa4049ed8220  ./partition_table/partition-table.bin
+9d4b13dc8c7941d767c8af3eacebb2141147128e976603c7017a4858e7ed7a4f  ./project_description.json
+4b10220f171859214051f7337573409724fec4b5c29e276c9aabc8b8a41212a6  ./wol-rs.bin
+a58b454e9a5c73eef98c585be3f007243f9e700d1aa0c472ab36120d0eb26baa  ./wol-rs.elf
