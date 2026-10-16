@@ -172,9 +172,9 @@ fn main() {
 
     // ---- Wi-Fi CSI 近场人体感知（~1 米内有人/无人，状态变化发 MQTT 通知）----
     // 需在 Wi-Fi 启动后（此时已拿到 IP）；失败不致命，仅失去感知能力
-    if let Err(e) = csi_presence::start() {
-        ::log::warn!("CSI presence probe failed to start: {e:#x} (continuing)");
-    }
+    // if let Err(e) = csi_presence::start() {
+    //     ::log::warn!("CSI presence probe failed to start: {e:#x} (continuing)");
+    // }
 
     ::log::info!("WakeManager ready");
 
